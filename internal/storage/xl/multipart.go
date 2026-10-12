@@ -16,6 +16,7 @@ import (
 	"nanoio/internal/meta"
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/internal/listing"
+	"nanoio/internal/storage/internal/objlock"
 	"nanoio/internal/storage/xl/disk"
 )
 
@@ -45,6 +46,8 @@ type uploadDoc struct {
 	ParityBlocks int               `json:"parityBlocks"`
 	BlockSize    int64             `json:"blockSize"`
 	Distribution []int             `json:"distribution"`
+	// Lock is the object lock requested when the upload was started.
+	Lock objlock.Requested `json:"lock,omitzero"`
 }
 
 func uploadLockKey(id string) string { return storage.DataDirPrefix + "upload-" + id }
@@ -114,9 +117,6 @@ func (x *XL) NewMultipartUpload(ctx context.Context, bucket, object string, opts
 	if err := validate(bucket, object); err != nil {
 		return "", err
 	}
-	if opts.Versioned {
-		return "", notImpl("versioned NewMultipartUpload")
-	}
 	if err := x.enter(ctx); err != nil {
 		return "", err
 	}
@@ -137,10 +137,18 @@ func (x *XL) NewMultipartUpload(ctx context.Context, bucket, object string, opts
 	if ct == "" {
 		ct = defaultCT
 	}
+	settings, err := x.versioning(ctx, bucket)
+	if err != nil {
+		return "", mapErr(err, bucket, object)
+	}
+	req, err := objlock.Request(settings.lock.cfg, opts, time.Now())
+	if err != nil {
+		return "", storage.Wrap(err, bucket, object)
+	}
 	docBytes, err := json.Marshal(uploadDoc{
 		Bucket: bucket, Object: object, Initiated: time.Now().UTC(), ContentType: ct,
 		UserDefined: copyMap(opts.UserDefined), DataBlocks: x.k, ParityBlocks: x.m,
-		BlockSize: x.blockSize, Distribution: x.distribution(bucket, object),
+		BlockSize: x.blockSize, Distribution: x.distribution(bucket, object), Lock: req,
 	})
 	if err != nil {
 		return "", err
@@ -344,7 +352,8 @@ func (x *XL) ListObjectParts(ctx context.Context, bucket, object, uploadID strin
 		return zero, err
 	}
 	defer unlock()
-	if _, err := x.readUpload(ctx, bucket, object, uploadID); err != nil {
+	udoc, err := x.readUpload(ctx, bucket, object, uploadID)
+	if err != nil {
 		return zero, err
 	}
 	docs, _ := x.partsQuorum(ctx, bucket, uploadID)
@@ -359,7 +368,7 @@ func (x *XL) ListObjectParts(ctx context.Context, bucket, object, uploadID strin
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	var res storage.ListPartsResult
+	res := storage.ListPartsResult{UserDefined: copyMap(udoc.UserDefined)}
 	for i, n := range numbers {
 		if i == limit {
 			res.IsTruncated = true
@@ -485,9 +494,6 @@ func (x *XL) CompleteMultipartUpload(ctx context.Context, bucket, object, upload
 	if err := checkUploadID(bucket, object, uploadID); err != nil {
 		return zero, err
 	}
-	if opts.Versioned {
-		return zero, notImpl("versioned CompleteMultipartUpload")
-	}
 	if len(parts) == 0 || len(parts) > maxParts {
 		return zero, storage.Wrap(fmt.Errorf("%w: %d parts listed", storage.ErrInvalidPart, len(parts)), bucket, object)
 	}
@@ -549,14 +555,6 @@ func (x *XL) CompleteMultipartUpload(ctx context.Context, bucket, object, upload
 	}
 	etag := fmt.Sprintf("%s-%d", hex.EncodeToString(sum.Sum(nil)), len(parts))
 
-	if err := x.requireBucket(ctx, bucket); err != nil {
-		return zero, err
-	}
-	st := x.stateOf(ctx, bucket, object)
-	if err := checkPreconditions(st, x.k, opts, bucket, object); err != nil {
-		return zero, err
-	}
-
 	// Stage a data dir on each drive that holds every listed part.
 	token, err := newToken()
 	if err != nil {
@@ -594,20 +592,19 @@ func (x *XL) CompleteMultipartUpload(ctx context.Context, bucket, object, upload
 	if ct == "" {
 		ct = defaultCT
 	}
-	gen, prevGen := nextGeneration(st, x.k)
-	tmpl := meta.Version{
-		Type: meta.TypeObject, Generation: gen, ModTime: time.Now().UTC(), Size: total, ETag: etag, DataDir: dataDir,
-		ContentType: ct, UserMeta: copyMap(doc.UserDefined), Parts: versionParts,
-	}
-	spec := commitSpec{bucket: bucket, object: object, stageID: stageID, dataDir: dataDir, tmpl: tmpl,
-		dist: doc.Distribution, blockSize: doc.BlockSize, sums: sums, participants: participants,
-		checkGen: true, prevGen: prevGen, need: x.writeQuorum()}
-	res := x.commit(ctx, spec)
-	if err := x.finishCommit(ctx, spec, res); err != nil {
-		return zero, mapErr(err, bucket, object)
+	info, err := x.publishVersion(ctx, bucket, object, publishSpec{
+		stageID: stageID, dataDir: dataDir, dist: doc.Distribution, blockSize: doc.BlockSize,
+		sums: sums, participants: participants,
+		tmpl: meta.Version{
+			Type: meta.TypeObject, Size: total, ETag: etag, DataDir: dataDir,
+			ContentType: ct, UserMeta: copyMap(doc.UserDefined), Parts: versionParts,
+		},
+	}, objlock.Carry(opts, doc.Lock, time.Now()))
+	if err != nil {
+		return zero, err
 	}
 	x.discardUpload(ctx, bucket, uploadID)
-	return toInfo(bucket, object, &tmpl), nil
+	return info, nil
 }
 
 func contains(s []int, v int) bool {

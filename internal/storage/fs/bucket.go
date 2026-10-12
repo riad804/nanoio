@@ -13,15 +13,28 @@ import (
 	"nanoio/internal/meta"
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/internal/fsutil"
+	"nanoio/internal/storage/internal/objlock"
 )
 
 type bucketDoc struct {
 	Created time.Time `json:"created"`
+	// Versioning is "", "Enabled" or "Suspended"; VersioningSeq counts the
+	// changes. Both are absent in a bucket that never had versioning.
+	Versioning    string `json:"versioning,omitempty"`
+	VersioningSeq uint64 `json:"versioningSeq,omitempty"`
+	// ObjectLock is the object lock configuration document (see package
+	// objlock); empty for a bucket created without object lock.
+	ObjectLock    string `json:"objectLock,omitempty"`
+	ObjectLockSeq uint64 `json:"objectLockSeq,omitempty"`
 }
 
 // MakeBucket creates bucket. The directory appears atomically with its
 // marker file already inside it, via a rename from staging.
-func (f *FS) MakeBucket(ctx context.Context, bucket string, _ storage.MakeBucketOptions) error {
+//
+// A bucket created with object lock is born versioned (Enabled) and locked
+// in the same marker, so there is no moment at which it accepts unprotected
+// writes.
+func (f *FS) MakeBucket(ctx context.Context, bucket string, mopts storage.MakeBucketOptions) error {
 	if err := storage.ValidateBucketName(bucket); err != nil {
 		return err
 	}
@@ -54,7 +67,12 @@ func (f *FS) MakeBucket(ctx context.Context, bucket string, _ storage.MakeBucket
 	}
 	defer f.holdStage(stage)()
 	defer os.RemoveAll(stage)
-	doc, err := json.Marshal(bucketDoc{Created: time.Now().UTC()})
+	bd := bucketDoc{Created: time.Now().UTC()}
+	if mopts.ObjectLock {
+		bd.Versioning, bd.VersioningSeq = string(storage.VersioningEnabled), 1
+		bd.ObjectLock, bd.ObjectLockSeq = objlock.Encode(storage.ObjectLockConfig{Enabled: true}), 1
+	}
+	doc, err := json.Marshal(bd)
 	if err != nil {
 		return err
 	}
@@ -164,6 +182,13 @@ func (f *FS) DeleteBucket(ctx context.Context, bucket string, opts storage.Delet
 		return err
 	}
 	dir, _ := f.path(bucket)
+	if opts.Force {
+		// Forced deletion removes every version at once; it must not be a
+		// way around object lock.
+		if err := f.checkForceDelete(ctx, bucket, dir); err != nil {
+			return err
+		}
+	}
 	if !opts.Force {
 		has, err := hasObjects(ctx, dir)
 		if err != nil {

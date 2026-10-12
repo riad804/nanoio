@@ -15,6 +15,7 @@ func withDefaults(c Config) Config {
 	d := Default()
 	c.Address, c.Domains, c.Region = d.Address, d.Domains, d.Region
 	c.UploadExpiry, c.GCInterval = d.UploadExpiry, d.GCInterval
+	c.KMS = d.KMS
 	return c
 }
 
@@ -305,4 +306,72 @@ func TestClusterConfig(t *testing.T) {
 			t.Errorf("cluster = %+v", c.Cluster)
 		}
 	})
+}
+
+func TestKMSConfig(t *testing.T) {
+	dir := t.TempDir()
+	base := func(k KMS) Config {
+		c := Default()
+		c.Root, c.RootUser, c.RootPassword, c.KMS = dir, "u", "p", k
+		return c
+	}
+	cfg, err := Load("", env(map[string]string{
+		EnvKMSBackend: "local", EnvKMSDefaultKey: "k", EnvKMSSecretKey: "k:AAAA", EnvKMSCacheTTL: "30s",
+		EnvKMSKESEndpoint: "https://kes", EnvAllowInsecureSSEC: "true",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.KMS.Backend != "local" || cfg.KMS.DefaultKey != "k" || cfg.KMS.SecretKey != "k:AAAA" ||
+		cfg.KMS.CacheTTL.D() != 30*time.Second || cfg.KMS.KES.Endpoint != "https://kes" || !cfg.AllowInsecureSSEC {
+		t.Errorf("env not applied: %+v", cfg.KMS)
+	}
+	if Default().KMS.CacheTTL.D() != 5*time.Minute {
+		t.Error("default cache TTL is not 5m")
+	}
+	// The secret key is environment only: a file cannot carry it.
+	p := filepath.Join(dir, "c.json")
+	os.WriteFile(p, []byte(`{"kms":{"secretKey":"k:AAAA"}}`), 0o600)
+	if _, err := Load(p, nil); err == nil {
+		t.Error("secretKey accepted from the config file")
+	}
+
+	tests := []struct {
+		name    string
+		kms     KMS
+		wantErr string
+	}{
+		{"none", KMS{}, ""},
+		{"local with secret", KMS{Backend: "local", DefaultKey: "k", SecretKey: "k:x"}, ""},
+		{"local with file", KMS{Backend: "local", DefaultKey: "k", Local: struct {
+			KeyFile string `json:"keyFile"`
+		}{"/keys"}}, ""},
+		{"local without keys", KMS{Backend: "local", DefaultKey: "k"}, "keyFile"},
+		{"no default key", KMS{Backend: "local", SecretKey: "k:x"}, "defaultKey"},
+		{"unknown backend", KMS{Backend: "vault", DefaultKey: "k"}, "must be"},
+		{"kes needs endpoint", KMS{Backend: "kes", DefaultKey: "k"}, "endpoint"},
+		{"negative ttl", KMS{CacheTTL: -1}, "cacheTTL"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := base(tt.kms)
+			err := c.Finalize()
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Errorf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+	// KES needs a credential.
+	c := base(KMS{Backend: "kes", DefaultKey: "k"})
+	c.KMS.KES.Endpoint = "https://kes"
+	if err := c.Finalize(); err == nil || !strings.Contains(err.Error(), "client certificate or an API key") {
+		t.Errorf("kes without credential: %v", err)
+	}
+	c.KMS.KES.APIKey = "token"
+	if err := c.Finalize(); err != nil {
+		t.Errorf("kes with api key: %v", err)
+	}
 }

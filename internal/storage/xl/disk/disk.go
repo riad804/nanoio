@@ -73,21 +73,83 @@ type FileWriter interface {
 	Abort()
 }
 
-// CommitRequest publishes a staged object on one drive.
+// CommitOp selects what a CommitRequest does to a key's xl.meta.
+type CommitOp uint8
+
+const (
+	// OpPut adds the staged object (DataDir, Version) as a version. A
+	// version with the same ID, in practice the null version, is replaced.
+	OpPut CommitOp = iota
+	// OpMarker adds the delete marker in Version.
+	OpMarker
+	// OpRemove removes the version VersionID, object or marker.
+	OpRemove
+	// OpReplace makes File the key's whole xl.meta, placing the staged
+	// DataDirs it references. It is how repair publishes, and is never
+	// conditional.
+	OpReplace
+	// OpSetLock replaces the object lock state of the object version
+	// VersionID with Lock (nil clears it), subject to meta.CheckLockChange.
+	OpSetLock
+	// OpSetMeta applies Meta to the object version VersionID in place.
+	OpSetMeta
+)
+
+// BucketSettings is what a drive's bucket marker records: the versioning
+// state and the object lock document (opaque here) with the sequence number
+// of the change that wrote each. A bucket that never had either reads the
+// zero value.
+type BucketSettings struct {
+	Versioning    string `json:"versioning,omitempty"`
+	VersioningSeq uint64 `json:"versioningSeq,omitempty"`
+	ObjectLock    string `json:"objectLock,omitempty"`
+	ObjectLockSeq uint64 `json:"objectLockSeq,omitempty"`
+}
+
+// CommitRequest changes one key's version list on one drive, atomically.
+//
+// The incremental operations (OpPut, OpMarker, OpRemove, OpSetLock) carry the
+// operation, not a precomputed list: the drive applies it to its own
+// xl.meta, so a drive that is a version behind can accept a write and a
+// per-drive field (erasure index, checksums) stays per drive.
 type CommitRequest struct {
 	Bucket, Object string
-	// StageID names the staging area holding DataDir.
+	Op             CommitOp
+	// StageID names the staging area holding the staged data directories.
 	StageID string
-	// DataDir is the staged data directory's name; it becomes the version's
-	// data directory.
+	// DataDir is the staged data directory's name for OpPut; it becomes
+	// the version's data directory.
 	DataDir string
-	// Version is this drive's version record, erasure info included.
+	// DataDirs are the staged data directories OpReplace places.
+	DataDirs []string
+	// Version is this drive's version record for OpPut and OpMarker,
+	// erasure info included. Its VersionID is chosen by the caller (a
+	// fresh UUID, or "" for the null version); its Seq is Seq.
 	Version meta.Version
+	// VersionID is the stored version ID OpRemove removes, and OpSetLock
+	// changes.
+	VersionID string
+	// Lock is the new lock state for OpSetLock.
+	Lock *meta.Lock
+	// Meta is the change OpSetMeta applies.
+	Meta *meta.MetaUpdate
+	// Guard says how object lock is judged: the time to judge retention
+	// against, and whether governance retention may be bypassed. The
+	// caller sets Now once so every drive decides alike; zero means the
+	// drive's own clock. Whatever Guard says, a drive refuses (ErrLocked)
+	// to remove or replace a version the lock protects.
+	Guard meta.Guard
+	// Seq is the key's generation after the change: the generation the
+	// caller read plus one. The drive's file takes it as Gen, and a new
+	// version as its Seq. Zero lets the drive number the change itself (a
+	// single drive has no one to agree with).
+	Seq uint64
+	// File is the complete xl.meta for OpReplace.
+	File *meta.File
 	// CheckGen makes the commit conditional: it fails with ErrConflict if
-	// the drive already holds a generation of the object greater than
+	// the drive already holds a generation of the key greater than
 	// PrevGen. A drive that is merely behind (older generation, or none)
-	// accepts, which is how a stale drive catches up. Repairs, which
-	// rewrite an existing generation, leave CheckGen unset.
+	// accepts, which is how a stale drive catches up.
 	CheckGen bool
 	PrevGen  uint64
 }
@@ -171,6 +233,21 @@ type Disk interface {
 	// DeleteBucket removes the bucket and its in-progress uploads. A
 	// missing bucket is not an error.
 	DeleteBucket(ctx context.Context, bucket string) error
+	// ReadBucketVersioning returns the bucket's versioning state ("",
+	// "Enabled" or "Suspended") and the sequence number of the change that
+	// set it. A bucket that never had versioning reads ("", 0).
+	ReadBucketVersioning(ctx context.Context, bucket string) (state string, seq uint64, err error)
+	// WriteBucketVersioning replaces the state and sequence atomically,
+	// keeping the bucket's creation record. ErrNotFound if the bucket is
+	// missing.
+	WriteBucketVersioning(ctx context.Context, bucket, state string, seq uint64) error
+	// ReadBucketSettings returns everything a bucket's marker records
+	// besides its creation time, in one read.
+	ReadBucketSettings(ctx context.Context, bucket string) (BucketSettings, error)
+	// WriteBucketObjectLock replaces the bucket's object lock document and
+	// its sequence number atomically, keeping the rest of the marker.
+	// ErrNotFound if the bucket is missing.
+	WriteBucketObjectLock(ctx context.Context, bucket, doc string, seq uint64) error
 	// ListKeys lists the keys under a bucket that have an xl.meta here.
 	ListKeys(ctx context.Context, bucket, prefix string) ([]string, error)
 

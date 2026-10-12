@@ -45,8 +45,9 @@ named here enforce it.
 * **Leave** is either *decommission* (mark the pool `draining`, restart all
   nodes, run `nanoio admin decommission`; objects are copied to the ring's
   sets and then removed) or *crash and heal* (drives return and the scanner
-  repairs them). Drained multipart objects are rewritten as single-part
-  objects: their ETag and last-modified time change.
+  repairs them). A drained multipart object is moved part for part (same
+  part numbers and sizes), so its ETag is kept; an encrypted object's part
+  layout is part of what its ciphertext means, which is why.
 
 ## Cross-set LIST
 
@@ -160,3 +161,71 @@ and `Remote` both pass.
   rebuilds a bare `*Error{Kind}` with the remote message as its cause text.
   `Kind` values are append-only: never renumber or reuse one
   (`TestKindValuesAreStable` is the tripwire).
+
+## Slow and failing drives
+
+* **Writes return at quorum.** Shard files are written by one goroutine per
+  drive with a bounded queue. A drive that falls more than `writeQueue`
+  blocks behind is dropped from the write if the quorum can spare it. When
+  the write quorum of drives has made its file durable, the rest get
+  `stragglerGrace` (default 500ms) and are then abandoned; the object is
+  queued for heal, which rebuilds those drives' shards. The same rule applies
+  to the commit phase: the write returns when K (K+1 when K == M) drives have
+  committed. A commit that lands later is finished in the background, and one
+  that lands after a newer write is refused by the drive's generation check.
+* **Metadata reads return at quorum** (when K > M): as soon as K drives agree
+  or enough say "absent". With K == M every drive is asked, because two
+  disjoint groups of K can exist.
+* **Deletes wait for every drive.** A delete that arrived late could remove
+  a newer write's copy, and, unlike a commit, it has no generation to be
+  refused by.
+* **Circuit breaker per remote drive.** After `BreakerThreshold` (2)
+  consecutive transport failures the drive fails fast for `DownFor` (1s), then
+  exactly one probe call is let through; a failed probe doubles the interval
+  (to 30s), a successful one closes the breaker. A caller that cancels its own
+  context does not count as a failure. Reads are not hedged: a drive that is
+  slow but answering still slows a GET.
+
+## Versioning in a cluster
+
+* A bucket's versioning state is held on every set (and every drive of it)
+  with the sequence number of the change that produced it. `SetBucketVersioning`
+  fans out to every set and fails unless all succeed; a set that missed a
+  change is brought to the newest state (highest sequence) by the periodic
+  bucket reconciliation (`EnsureBuckets`), which also runs at start.
+* A delete marker or version removal is routed to the set that holds the
+  key, or to the ring's set for a key with no history. A named version is
+  looked for on every set when there is more than one pool.
+* `nanoio admin decommission` refuses a pool that holds a versioned bucket.
+* `ListObjectVersions` merges the sets' pages like `ListObjects` does and
+  fails, rather than returning a partial listing, when a set cannot answer.
+
+## Object lock in a cluster
+
+* A bucket created with `x-amz-bucket-object-lock-enabled: true` is made, on
+  every drive of every set, versioned and locked in one step under the bucket's
+  exclusive lock; if a write quorum of a set does not take it the bucket is
+  removed again. The lock configuration (the default retention) is a second
+  document in the bucket marker, with its own sequence number, read from a read
+  quorum together with the versioning state.
+* `SetBucketObjectLock` fans out to every set like `SetBucketVersioning`;
+  `EnsureBuckets` carries the newest configuration to a set that missed it, and
+  creates a bucket on a newly added pool **with** object lock when it has it
+  elsewhere. A set that cannot be asked about the lock configuration is left
+  alone rather than created bare.
+* `GetBucketObjectLock` needs every set to answer. At equal sequence a set that
+  has the lock beats one that does not: the unprotected reading is the
+  dangerous one.
+* Retention is judged by the node that coordinates a change, using its own
+  clock, and that instant is sent to every drive. **Keep clocks synchronised**:
+  a node that runs fast lets a version go early by that much.
+* Drives enforce the rule too: a drive refuses to remove or replace a protected
+  version even when asked by a peer (`KindLocked`, wire kind 10), and refuses
+  whole-key removal of a key that holds one. This holds for heal and for
+  forced bucket deletion, which is refused while anything in the bucket is
+  protected.
+* `nanoio admin decommission` refuses a pool holding a versioned bucket, and
+  therefore every object lock bucket.
+* New RPC operations: `bucket.settings.get`, `bucket.lock.set`. Upgrade every
+  node before creating an object lock bucket; a node that predates them cannot
+  take part in one.

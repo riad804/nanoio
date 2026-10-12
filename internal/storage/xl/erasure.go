@@ -11,6 +11,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/xl/disk"
@@ -122,21 +123,27 @@ var errEvicted = errors.New("shard writer evicted")
 // failed reports whether the writer can no longer produce a good file.
 func (w *shardWriter) failed() bool { return w.evicted.Load() || w.firstErr() != nil }
 
-// enqueue hands a block to the writer. With droppable set, a full queue
-// evicts the writer instead of waiting (the caller has quorum to spare).
-// The block must not be reused by the caller.
-func (w *shardWriter) enqueue(ctx context.Context, b []byte, droppable bool) {
+// enqueue hands a block to the writer. A full queue is waited out: the
+// producer is memory-speed and every drive is slower than it, so a full
+// queue alone proves nothing. With droppable set the wait is bounded by
+// stall; a writer that has made no room by then is evicted (the caller has
+// quorum to spare). The block must not be reused by the caller.
+func (w *shardWriter) enqueue(ctx context.Context, b []byte, droppable bool, stall time.Duration) {
 	select {
 	case w.in <- b:
 		return
 	default:
 	}
+	var timeout <-chan time.Time
 	if droppable {
-		w.evict()
-		return
+		t := time.NewTimer(stall)
+		defer t.Stop()
+		timeout = t.C
 	}
 	select {
 	case w.in <- b:
+	case <-timeout:
+		w.evict()
 	case <-ctx.Done():
 		w.evict()
 	}
@@ -252,7 +259,7 @@ func (x *XL) queueShards(ctx context.Context, ws []*shardWriter, shards [][]byte
 		}
 		cp := make([]byte, len(shards[i]))
 		copy(cp, shards[i])
-		w.enqueue(ctx, cp, live-1 >= minLive)
+		w.enqueue(ctx, cp, live-1 >= minLive, x.stallTimeout)
 		if w.failed() { // evicted for lagging
 			ws[i] = nil
 			live--
@@ -262,6 +269,17 @@ func (x *XL) queueShards(ctx context.Context, ws []*shardWriter, shards [][]byte
 }
 
 func quorumError(bucket, object string, got, need int, errs []error) error {
+	// Enough drives refusing because object lock protects the version to
+	// make a quorum impossible is a refusal, not an outage.
+	locked := 0
+	for _, e := range errs {
+		if e != nil && errors.Is(e, storage.ErrObjectLocked) {
+			locked++
+		}
+	}
+	if locked > 0 && locked > len(errs)-need {
+		return storage.Wrap(fmt.Errorf("%w: refused by %d drives", storage.ErrObjectLocked, locked), bucket, object)
+	}
 	detail := ""
 	shown := 0
 	for i, e := range errs {

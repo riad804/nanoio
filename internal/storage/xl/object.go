@@ -10,12 +10,13 @@ import (
 	"hash"
 	"io"
 	"strings"
-	"sync"
 	"time"
 
 	"nanoio/internal/meta"
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/internal/listing"
+	"nanoio/internal/storage/internal/objlock"
+	"nanoio/internal/storage/xl/disk"
 )
 
 func newToken() (string, error) {
@@ -26,14 +27,35 @@ func newToken() (string, error) {
 	return strings.ReplaceAll(id, "-", ""), nil
 }
 
-// removeStages discards a staging area on every drive; unknown stages and
-// offline drives are ignored.
+// removeStages discards a staging area on every drive, in parallel. It
+// waits for the drives only as long as StragglerGrace; a slow one finishes
+// in the background (an unremoved staging area is swept later anyway).
 func (x *XL) removeStages(ctx context.Context, stageID string) {
-	ctx, cancel := detached(ctx)
-	defer cancel()
+	dctx, cancel := detached(ctx)
+	done := make(chan struct{}, len(x.drives))
 	for _, d := range x.drives {
-		d.RemoveStage(ctx, stageID)
+		go func() {
+			d.RemoveStage(dctx, stageID)
+			done <- struct{}{}
+		}()
 	}
+	timer := time.NewTimer(x.stragglerGrace)
+	defer timer.Stop()
+	for range x.drives {
+		select {
+		case <-done:
+		case <-timer.C:
+			// Let the stragglers finish, then release the context.
+			go func(rest int) {
+				for ; rest > 0; rest-- {
+					<-done
+				}
+				cancel()
+			}(len(x.drives))
+			return
+		}
+	}
+	cancel()
 }
 
 // PutObject erasure-codes r across the drives and publishes it atomically.
@@ -43,9 +65,6 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 	var zero storage.ObjectInfo
 	if err := validate(bucket, object); err != nil {
 		return zero, err
-	}
-	if opts.Versioned {
-		return zero, notImpl("versioned PutObject")
 	}
 	if size > maxObjectSize {
 		return zero, storage.Wrap(storage.ErrEntityTooLarge, bucket, object)
@@ -117,23 +136,9 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 		return zero, err
 	}
 	defer unlockKey()
-	if err := x.requireBucket(ctx, bucket); err != nil {
-		return zero, err
-	}
-	st := x.stateOf(ctx, bucket, object)
-	if err := checkPreconditions(st, x.k, opts, bucket, object); err != nil {
-		return zero, err
-	}
-
 	ct := opts.ContentType
 	if ct == "" {
 		ct = defaultCT
-	}
-	gen, prevGen := nextGeneration(st, x.k)
-	tmpl := meta.Version{
-		Type: meta.TypeObject, Generation: gen, ModTime: time.Now().UTC(), Size: n, ETag: etag, DataDir: dataDir,
-		ContentType: ct, UserMeta: copyMap(opts.UserDefined),
-		Parts: []meta.Part{{N: 1, Size: n, ETag: etag}},
 	}
 	sums := make([][]meta.Checksum, len(x.drives))
 	for d := range x.drives {
@@ -141,36 +146,104 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 			sums[d] = []meta.Checksum{{Part: 1, Algorithm: hashAlgorithm, Hash: roots[d]}}
 		}
 	}
-	spec := commitSpec{bucket: bucket, object: object, stageID: stageID, dataDir: dataDir,
-		tmpl: tmpl, dist: dist, blockSize: x.blockSize, sums: sums, participants: parts,
-		checkGen: true, prevGen: prevGen, need: x.writeQuorum()}
+	return x.publishVersion(ctx, bucket, object, publishSpec{
+		stageID: stageID, dataDir: dataDir, dist: dist, blockSize: x.blockSize, sums: sums, participants: parts,
+		tmpl: meta.Version{
+			Type: meta.TypeObject, Size: n, ETag: etag, DataDir: dataDir, ContentType: ct,
+			UserMeta: opts.FinalUserDefined(),
+			Parts:    []meta.Part{{N: 1, Size: n, ETag: etag}},
+		},
+	}, opts)
+}
+
+// publishSpec is what publishVersion needs besides the staged data's
+// location: the version record without its ID, number and time.
+type publishSpec struct {
+	stageID, dataDir string
+	dist             []int
+	blockSize        int64
+	sums             [][]meta.Checksum
+	participants     []bool
+	tmpl             meta.Version
+}
+
+// metaVersioning converts a bucket's state to the form the meta mutation
+// functions take.
+func metaVersioning(s storage.VersioningState) meta.Versioning {
+	switch s {
+	case storage.VersioningEnabled:
+		return meta.Enabled
+	case storage.VersioningSuspended:
+		return meta.Suspended
+	}
+	return meta.Unversioned
+}
+
+// publishVersion commits a staged object as a new version of
+// bucket/object. The caller holds the bucket's shared lock and the key's
+// exclusive lock. The bucket's versioning state is read here, under that
+// lock, so it cannot change between the decision and the commit; the
+// version's ID (a new UUID when versioning is enabled, the null version
+// otherwise) and sequence number are chosen once and sent to every drive.
+func (x *XL) publishVersion(ctx context.Context, bucket, object string, ps publishSpec, opts storage.PutOptions) (storage.ObjectInfo, error) {
+	var zero storage.ObjectInfo
+	if err := x.requireBucket(ctx, bucket); err != nil {
+		return zero, err
+	}
+	cfg, err := x.versioning(ctx, bucket)
+	if err != nil {
+		return zero, mapErr(err, bucket, object)
+	}
+	st := x.stateOf(ctx, bucket, object)
+	if err := checkPreconditions(st, x.k, opts, bucket, object); err != nil {
+		return zero, err
+	}
+	id, err := meta.VersionIDFor(metaVersioning(cfg.cfg.State))
+	if err != nil {
+		return zero, err
+	}
+	prev := uint64(0)
+	if st.found(x.k) {
+		prev = st.generation()
+	}
+	// The bucket's lock configuration is part of the settings read under
+	// the shared bucket lock, so what is applied is what the bucket says now.
+	now := time.Now().UTC()
+	lock, err := objlock.Resolve(cfg.lock.cfg, opts, now)
+	if err != nil {
+		return zero, storage.Wrap(err, bucket, object)
+	}
+	tmpl := ps.tmpl
+	tmpl.VersionID, tmpl.Seq, tmpl.ModTime, tmpl.Lock = id, prev+1, now, lock
+	spec := commitSpec{bucket: bucket, object: object, op: disk.OpPut, stageID: ps.stageID, dataDir: ps.dataDir,
+		tmpl: tmpl, dist: ps.dist, blockSize: ps.blockSize, sums: ps.sums, participants: ps.participants,
+		checkGen: true, prevGen: prev, need: x.writeQuorum(), guard: objlock.Guard(now, false)}
 	res := x.commit(ctx, spec)
 	if err := x.finishCommit(ctx, spec, res); err != nil {
 		return zero, mapErr(err, bucket, object)
 	}
-	return toInfo(bucket, object, &tmpl), nil
+	x.noteVersioning(bucket, cfg.cfg)
+	return toInfo(bucket, object, &tmpl, true, cfg.cfg.State), nil
 }
 
-// openWriters stages the shard file rel under stageID on every ready drive,
-// returning writers indexed by shard and which drives participate.
+// openWriters stages the shard file rel under stageID on the drives,
+// returning writers indexed by shard and which drives participate. It
+// returns once a write quorum of drives has a staged file (plus the
+// straggler grace); a drive that answers later has its file discarded.
 func (x *XL) openWriters(ctx context.Context, stageID, rel string, dist []int) (ws []*shardWriter, participants []bool) {
 	ws = make([]*shardWriter, len(x.drives))
 	participants = make([]bool, len(x.drives))
-	var wg syncWG
-	var mu sync.Mutex
-	for i, d := range x.drives {
-		wg.Go(func() {
-			w, err := newShardWriter(ctx, d, stageID, rel, x.writeQueue)
-			if err != nil {
-				return
-			}
-			mu.Lock()
+	got, errs := scatter(ctx, x, x.writeQuorum(), x.stragglerGrace, true, false,
+		func(ctx context.Context, d *drive) (*shardWriter, error) {
+			return newShardWriter(ctx, d, stageID, rel, x.writeQueue)
+		},
+		func(_ int, w *shardWriter) { w.evict() })
+	for i, w := range got {
+		if errs[i] == nil && w != nil {
 			ws[dist[i]] = w
 			participants[i] = true
-			mu.Unlock()
-		})
+		}
 	}
-	wg.Wait()
 	return ws, participants
 }
 
@@ -279,13 +352,35 @@ func (x *XL) lookup(ctx context.Context, bucket, object string) (*objState, erro
 	return nil, x.failure(st, bucket, object)
 }
 
+// resolve picks the version a read addresses out of the agreed list. A
+// delete marker is a *storage.DeleteMarkerError (see its documentation).
+func (x *XL) resolve(ctx context.Context, bucket, object, versionID string, st *objState) (*meta.Version, bool, storage.VersioningState, error) {
+	stored, err := storage.StoredVersionID(versionID)
+	if err != nil {
+		return nil, false, "", storage.Wrap(err, bucket, object)
+	}
+	explicit := versionID != ""
+	v, rerr := st.file.Resolve(stored, !explicit)
+	if rerr != nil {
+		return nil, false, "", storage.Wrap(storage.ErrVersionNotFound, bucket, object)
+	}
+	state := x.reportState(ctx, bucket)
+	if v.Type == meta.TypeDeleteMarker {
+		return nil, false, state, &storage.DeleteMarkerError{
+			Bucket: bucket, Object: object, ModTime: v.ModTime, Explicit: explicit,
+			VersionID: storage.ReportedVersionID(state, v.VersionID),
+		}
+	}
+	return v, v == st.file.Latest(), state, nil
+}
+
 // StatObject returns object metadata agreed by a read quorum.
 func (x *XL) StatObject(ctx context.Context, bucket, object string, opts storage.GetOptions) (storage.ObjectInfo, error) {
 	if err := validate(bucket, object); err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	if opts.VersionID != "" {
-		return storage.ObjectInfo{}, storage.Wrap(storage.ErrVersionNotFound, bucket, object)
+	if _, err := storage.StoredVersionID(opts.VersionID); err != nil {
+		return storage.ObjectInfo{}, storage.Wrap(err, bucket, object)
 	}
 	if err := x.enter(ctx); err != nil {
 		return storage.ObjectInfo{}, err
@@ -300,19 +395,23 @@ func (x *XL) StatObject(ctx context.Context, bucket, object string, opts storage
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	return toInfo(bucket, object, st.ver), nil
+	v, latest, state, err := x.resolve(ctx, bucket, object, opts.VersionID, st)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	return toInfo(bucket, object, v, latest, state), nil
 }
 
-// GetObject opens an object. Its data directories are pinned before the
-// lock is released, so the returned reader is a stable snapshot that a
+// GetObject opens an object version. Its data directories are pinned before
+// the lock is released, so the returned reader is a stable snapshot that a
 // later overwrite or delete cannot disturb.
 func (x *XL) GetObject(ctx context.Context, bucket, object string, opts storage.GetOptions) (io.ReadCloser, storage.ObjectInfo, error) {
 	var zero storage.ObjectInfo
 	if err := validate(bucket, object); err != nil {
 		return nil, zero, err
 	}
-	if opts.VersionID != "" {
-		return nil, zero, storage.Wrap(storage.ErrVersionNotFound, bucket, object)
+	if _, err := storage.StoredVersionID(opts.VersionID); err != nil {
+		return nil, zero, storage.Wrap(err, bucket, object)
 	}
 	if err := x.enter(ctx); err != nil {
 		return nil, zero, err
@@ -327,13 +426,17 @@ func (x *XL) GetObject(ctx context.Context, bucket, object string, opts storage.
 	if err != nil {
 		return nil, zero, err
 	}
-	info := toInfo(bucket, object, st.ver)
+	v, latest, state, err := x.resolve(ctx, bucket, object, opts.VersionID, st)
+	if err != nil {
+		return nil, zero, err
+	}
+	info := toInfo(bucket, object, v, latest, state)
 	if rg := opts.Range; rg != nil {
-		if rg.Start < 0 || rg.Length <= 0 || rg.Start+rg.Length > st.ver.Size {
+		if rg.Start < 0 || rg.Length <= 0 || rg.Start+rg.Length > v.Size {
 			return nil, zero, storage.Wrap(storage.ErrInvalidRange, bucket, object)
 		}
 	}
-	rd, err := x.newObjectReader(ctx, bucket, object, st)
+	rd, err := x.newObjectReader(ctx, bucket, object, st, v)
 	if err != nil {
 		return nil, zero, err
 	}
@@ -350,17 +453,25 @@ func (x *XL) GetObject(ctx context.Context, bucket, object string, opts storage.
 	return rd, info, nil
 }
 
-// DeleteObject removes an object from every drive. Deleting a missing
-// object succeeds. It succeeds when a write quorum of drives is clean of
-// the object afterwards; shards on drives that were offline are removed by
-// the scanner (a lone survivor below read quorum is dangling, never
-// resurrected).
+// DeleteObject implements storage.StorageAPI.
+//
+//   - With opts.VersionID that one version (object or delete marker) is
+//     removed permanently; naming a version that is not there succeeds.
+//   - Without it an Unversioned bucket loses the object (from every drive,
+//     as before versioning), an Enabled bucket gets a delete marker with a
+//     new version ID (also for a key that has no versions, as in S3), and a
+//     Suspended bucket gets a null delete marker replacing the null version.
+//
+// The lock protects the key's whole version list: bucket shared, key
+// exclusive, as for a write. Version changes are conditional on the
+// generation the lock holder read.
 func (x *XL) DeleteObject(ctx context.Context, bucket, object string, opts storage.DeleteOptions) (storage.DeleteResult, error) {
 	if err := validate(bucket, object); err != nil {
 		return storage.DeleteResult{}, err
 	}
-	if opts.Versioned || opts.VersionID != "" {
-		return storage.DeleteResult{}, notImpl("versioned DeleteObject")
+	stored, err := storage.StoredVersionID(opts.VersionID)
+	if err != nil {
+		return storage.DeleteResult{}, storage.Wrap(err, bucket, object)
 	}
 	if err := x.enter(ctx); err != nil {
 		return storage.DeleteResult{}, err
@@ -379,19 +490,98 @@ func (x *XL) DeleteObject(ctx context.Context, bucket, object string, opts stora
 	if err := x.requireBucket(ctx, bucket); err != nil {
 		return storage.DeleteResult{}, err
 	}
-	// A delete waits for every drive, unlike a write: a delayed delete
-	// that lands after a newer write would remove that write's copy on
-	// the drive, and unlike a commit it carries no generation to refuse.
-	errs := x.each(ctx, func(d *drive) error { return d.DeleteObject(ctx, bucket, object) })
-	if countNil(errs) < x.writeQuorum() {
-		return storage.DeleteResult{}, quorumError(bucket, object, countNil(errs), x.writeQuorum(), errs)
+	cfg, err := x.versioning(ctx, bucket)
+	if err != nil {
+		return storage.DeleteResult{}, mapErr(err, bucket, object)
 	}
-	return storage.DeleteResult{}, nil
+	state := cfg.cfg.State
+	st := meta.Versioning(metaVersioning(state))
+	if opts.VersionID == "" && st == meta.Unversioned {
+		// A write quorum of drives must be clean of the object afterwards;
+		// shards on drives that were offline are removed by the scanner (a
+		// lone survivor below read quorum is dangling, never resurrected).
+		// A delete waits for every drive: it carries no generation, so one
+		// that arrived late could remove a newer write's copy.
+		//
+		// A key that holds a protected version is never removed whole. (A
+		// bucket with object lock is always versioned, so this is only
+		// reachable by something that bypassed the bucket's settings; each
+		// drive refuses as well.)
+		if obj := x.stateOf(ctx, bucket, object); obj.found(x.k) {
+			if err := obj.file.Protected(objlock.Guard(time.Now(), opts.BypassGovernance)); err != nil {
+				return storage.DeleteResult{}, objlock.Err(err, bucket, object)
+			}
+		}
+		errs := x.each(ctx, func(d *drive) error { return d.DeleteObject(ctx, bucket, object) })
+		if countNil(errs) < x.writeQuorum() {
+			return storage.DeleteResult{}, quorumError(bucket, object, countNil(errs), x.writeQuorum(), errs)
+		}
+		return storage.DeleteResult{}, nil
+	}
+
+	obj := x.stateOf(ctx, bucket, object)
+	if !obj.found(x.k) && !obj.missing(len(x.drives), x.k) {
+		return storage.DeleteResult{}, x.failure(obj, bucket, object)
+	}
+	known := obj.found(x.k)
+	prev := uint64(0)
+	if known {
+		prev = obj.generation()
+	}
+	spec := commitSpec{bucket: bucket, object: object, checkGen: true, prevGen: prev, need: x.writeQuorum(),
+		participants: make([]bool, len(x.drives))}
+	for i, d := range x.drives {
+		spec.participants[i] = d.Ready(ctx)
+	}
+	now := time.Now().UTC()
+	spec.guard = objlock.Guard(now, opts.BypassGovernance)
+	var res storage.DeleteResult
+	switch {
+	case opts.VersionID != "":
+		res.VersionID = storage.ReportedVersionID(state, stored)
+		var v *meta.Version
+		if known {
+			v = obj.file.Find(stored)
+		}
+		if v == nil {
+			return res, nil // not there: nothing to remove
+		}
+		// Object lock is judged here, under the key lock, on the version
+		// list a read quorum agrees on, and again by every drive.
+		if err := meta.CheckRemove(v, spec.guard); err != nil {
+			return storage.DeleteResult{}, objlock.Err(err, bucket, object)
+		}
+		res.DeleteMarker = v.Type == meta.TypeDeleteMarker
+		spec.op, spec.removeID = disk.OpRemove, stored
+		spec.tmpl.Seq = prev + 1
+	default:
+		id, err := meta.VersionIDFor(st)
+		if err != nil {
+			return storage.DeleteResult{}, err
+		}
+		if known {
+			// Replacing the null version (suspended buckets) removes it.
+			if old := obj.file.Find(id); old != nil {
+				if err := meta.CheckRemove(old, spec.guard); err != nil {
+					return storage.DeleteResult{}, objlock.Err(err, bucket, object)
+				}
+			}
+		}
+		spec.op = disk.OpMarker
+		spec.tmpl = meta.Version{Type: meta.TypeDeleteMarker, VersionID: id, Seq: prev + 1, ModTime: now}
+		res.VersionID, res.DeleteMarker = storage.ReportedVersionID(state, id), true
+	}
+	cres := x.commit(ctx, spec)
+	if err := x.finishCommit(ctx, spec, cres); err != nil {
+		return storage.DeleteResult{}, mapErr(err, bucket, object)
+	}
+	return res, nil
 }
 
 // ListObjects lists keys in UTF-8 byte order. Keys are gathered from enough
 // drives to see every committed object, and each is confirmed by a
-// metadata read quorum, so a stray shard on one drive never appears.
+// metadata read quorum, so a stray shard on one drive never appears. A key
+// whose latest version is a delete marker is not listed.
 func (x *XL) ListObjects(ctx context.Context, bucket string, opts storage.ListOptions) (storage.ListResult, error) {
 	if err := storage.ValidateBucketName(bucket); err != nil {
 		return storage.ListResult{}, err
@@ -407,27 +597,56 @@ func (x *XL) ListObjects(ctx context.Context, bucket string, opts storage.ListOp
 	if err != nil {
 		return storage.ListResult{}, mapErr(err, bucket, "")
 	}
+	state := x.reportState(ctx, bucket)
 	return listing.Page(keys, opts, func(key string) (storage.ObjectInfo, bool) {
 		st := x.stateOf(ctx, bucket, key)
 		if !st.found(x.k) {
 			return storage.ObjectInfo{}, false
 		}
-		return toInfo(bucket, key, st.ver), true
+		l := st.latest()
+		if l == nil || l.Type != meta.TypeObject {
+			return storage.ObjectInfo{}, false
+		}
+		return toInfo(bucket, key, l, true, state), true
 	}), nil
 }
 
-// ListObjectVersions, CopyObject and UpdateObjectMetadata are outside this
-// backend's scope, exactly as in fs, and say so.
-func (x *XL) ListObjectVersions(context.Context, string, storage.ListOptions) (storage.ListVersionsResult, error) {
-	return storage.ListVersionsResult{}, notImpl("ListObjectVersions")
+// ListObjectVersions lists every version and delete marker (see the fs
+// backend for the ordering and markers). Each key's list is confirmed by a
+// metadata read quorum.
+func (x *XL) ListObjectVersions(ctx context.Context, bucket string, opts storage.ListOptions) (storage.ListVersionsResult, error) {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return storage.ListVersionsResult{}, err
+	}
+	if err := x.enter(ctx); err != nil {
+		return storage.ListVersionsResult{}, err
+	}
+	defer x.leave()
+	if err := x.requireBucket(ctx, bucket); err != nil {
+		return storage.ListVersionsResult{}, err
+	}
+	keys, err := x.listKeys(ctx, bucket, opts.Prefix)
+	if err != nil {
+		return storage.ListVersionsResult{}, mapErr(err, bucket, "")
+	}
+	state := x.reportState(ctx, bucket)
+	return listing.PageVersions(keys, opts, func(key string) ([]storage.ObjectInfo, bool) {
+		st := x.stateOf(ctx, bucket, key)
+		if !st.found(x.k) {
+			return nil, false
+		}
+		out := make([]storage.ObjectInfo, 0, len(st.file.Versions))
+		for i := range st.file.Versions {
+			out = append(out, toInfo(bucket, key, &st.file.Versions[i], i == 0, state))
+		}
+		return out, true
+	}), nil
 }
 
+// CopyObject is outside this backend's scope (the API layer composes it),
+// exactly as in fs, and say so.
 func (x *XL) CopyObject(context.Context, storage.ObjectRef, storage.ObjectRef, storage.CopyOptions) (storage.ObjectInfo, error) {
 	return storage.ObjectInfo{}, notImpl("CopyObject")
-}
-
-func (x *XL) UpdateObjectMetadata(context.Context, string, string, storage.UpdateMetaOptions) (storage.ObjectInfo, error) {
-	return storage.ObjectInfo{}, notImpl("UpdateObjectMetadata")
 }
 
 func notImpl(op string) error {

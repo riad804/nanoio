@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"nanoio/internal/kms"
+	"nanoio/internal/sse"
 	"nanoio/internal/storage"
 )
 
@@ -66,10 +68,44 @@ func (s *Server) createMultipartUpload(q *request) {
 		s.fail(q, err)
 		return
 	}
+	lock, aerr := parseLockHeaders(q.r.Header)
+	if aerr != nil {
+		s.fail(q, aerr)
+		return
+	}
+	if !s.authorizeLockHeaders(q, lock) {
+		return
+	}
+	opts.Retention, opts.LegalHold = lock.retention, lock.hold
+	spec, err := s.writeSpec(q, q.bucket)
+	if err != nil {
+		s.fail(q, err)
+		return
+	}
+	var meta *sse.Meta
+	if spec != nil {
+		defer kms.Zero(spec.clientKey)
+		// One object key per upload; each part derives its own key from it.
+		ok, m, err := sse.NewObjectKey(q.r.Context(), s.kms, spec.params(q.bucket+"/"+q.key))
+		if err != nil {
+			s.fail(q, s.sseError(q, spec.mode, err))
+			return
+		}
+		kms.Zero(ok)
+		ud := make(map[string]string, len(opts.UserDefined)+8)
+		for k, v := range opts.UserDefined {
+			ud[k] = v
+		}
+		m.Put(ud)
+		opts.UserDefined, meta = ud, m
+	}
 	id, err := s.st.NewMultipartUpload(q.r.Context(), q.bucket, q.key, opts)
 	if err != nil {
 		s.fail(q, err)
 		return
+	}
+	if meta != nil {
+		setSSEHeaders(q.w.Header(), meta, ssecKeyMD5(spec))
 	}
 	s.writeXML(q, http.StatusOK, &initiateMultipartUploadResult{Bucket: q.bucket, Key: q.key, UploadID: id})
 }
@@ -97,18 +133,38 @@ func (s *Server) uploadPart(q *request) {
 		s.uploadPartCopy(q, id, n)
 		return
 	}
+	if aerr := rejectSSEOnRead(q.r.Header); aerr != nil {
+		s.fail(q, aerr)
+		return
+	}
+	enc, _, err := s.uploadEncryption(q, id, ssecPrefix)
+	if err != nil {
+		s.fail(q, err)
+		return
+	}
+	defer enc.close()
 	b, err := parseBody(q.r, q.res)
 	if err != nil {
 		s.fail(q, err)
 		return
 	}
-	part, err := s.st.PutObjectPart(q.r.Context(), q.bucket, q.key, id, n, b.body, b.size,
-		storage.PartOptions{ContentMD5: b.md5, ContentSHA256: b.sha256})
+	body, size, popts := b.body, b.size, storage.PartOptions{ContentMD5: b.md5, ContentSHA256: b.sha256}
+	if enc != nil {
+		// Digests are over the plaintext the client sent; storage sees
+		// ciphertext, so verify here.
+		vr := newVerifyReader(b.body, b.md5, b.sha256)
+		body, size, popts = sse.NewEncrypter(vr, sse.PartKey(enc.key, n)), sse.CipherSize(b.size), storage.PartOptions{}
+	}
+	part, err := s.st.PutObjectPart(q.r.Context(), q.bucket, q.key, id, n, body, size, popts)
 	if err != nil {
 		s.fail(q, err)
 		return
 	}
-	q.w.Header()["ETag"] = []string{`"` + part.ETag + `"`}
+	h := q.w.Header()
+	h["ETag"] = []string{`"` + part.ETag + `"`}
+	if enc != nil {
+		setSSEHeaders(h, enc.meta, enc.clientMD5)
+	}
 	q.w.WriteHeader(http.StatusOK)
 }
 
@@ -167,12 +223,16 @@ func parseCopyRange(v string, size int64) (start, length int64, err *APIError) {
 
 // copyConditionsFail reports whether the x-amz-copy-source-if-* headers
 // reject the source.
-func copyConditionsFail(h http.Header, info storage.ObjectInfo) bool {
+//
+// etag is the ETag the client knows the source by; for an encrypted object
+// that is the plaintext one, and the stored ETag (info.ETag) matches too.
+func copyConditionsFail(h http.Header, info storage.ObjectInfo, etag string) bool {
 	mod := info.ModTime.UTC().Truncate(time.Second)
-	if v := h.Get("x-amz-copy-source-if-match"); v != "" && !etagMatches(v, info.ETag) {
+	matches := func(v string) bool { return etagMatches(v, etag) || etagMatches(v, info.ETag) }
+	if v := h.Get("x-amz-copy-source-if-match"); v != "" && !matches(v) {
 		return true
 	}
-	if v := h.Get("x-amz-copy-source-if-none-match"); v != "" && etagMatches(v, info.ETag) {
+	if v := h.Get("x-amz-copy-source-if-none-match"); v != "" && matches(v) {
 		return true
 	}
 	if v := h.Get("x-amz-copy-source-if-unmodified-since"); v != "" {
@@ -207,39 +267,76 @@ func (s *Server) uploadPartCopy(q *request, id string, n int) {
 		return
 	}
 	ctx := q.r.Context()
+	if src.bucket == sysBucket {
+		s.fail(q, storage.ErrBucketNotFound)
+		return
+	}
+	dst, _, err := s.uploadEncryption(q, id, ssecPrefix)
+	if err != nil {
+		s.fail(q, err)
+		return
+	}
+	defer dst.close()
 	rc, info, err := s.st.GetObject(ctx, src.bucket, src.key, storage.GetOptions{VersionID: src.versionID})
 	if err != nil {
 		s.fail(q, err)
 		return
 	}
 	defer rc.Close()
-	if copyConditionsFail(q.r.Header, info) {
+	srcEnc, err := s.openEncrypted(q, info, ssecCopyPrefix)
+	if err != nil {
+		s.fail(q, err)
+		return
+	}
+	defer srcEnc.close()
+	size, etag := info.Size, info.ETag
+	if srcEnc != nil {
+		size, etag = srcEnc.size, srcEnc.etag
+	}
+	if copyConditionsFail(q.r.Header, info, etag) {
 		s.fail(q, errPrecondition)
 		return
 	}
-	start, length := int64(0), info.Size
+	start, length := int64(0), size
 	if v := q.r.Header.Get("x-amz-copy-source-range"); v != "" {
-		if start, length, aerr = parseCopyRange(v, info.Size); aerr != nil {
+		if start, length, aerr = parseCopyRange(v, size); aerr != nil {
 			s.fail(q, aerr)
 			return
 		}
 	}
-	if start > 0 {
-		var err error
-		if sk, ok := rc.(io.Seeker); ok {
-			_, err = sk.Seek(start, io.SeekStart)
-		} else {
-			_, err = io.CopyN(io.Discard, rc, start)
-		}
+	var body io.Reader
+	if srcEnc != nil {
+		body, err = sse.NewDecrypter(rc, srcEnc.layout, srcEnc.key, start, length)
 		if err != nil {
 			s.fail(q, err)
 			return
 		}
+	} else {
+		if start > 0 {
+			var err error
+			if sk, ok := rc.(io.Seeker); ok {
+				_, err = sk.Seek(start, io.SeekStart)
+			} else {
+				_, err = io.CopyN(io.Discard, rc, start)
+			}
+			if err != nil {
+				s.fail(q, err)
+				return
+			}
+		}
+		body = io.LimitReader(rc, length)
 	}
-	part, err := s.st.PutObjectPart(ctx, q.bucket, q.key, id, n, io.LimitReader(rc, length), length, storage.PartOptions{})
+	storedLen := length
+	if dst != nil {
+		body, storedLen = sse.NewEncrypter(body, sse.PartKey(dst.key, n)), sse.CipherSize(length)
+	}
+	part, err := s.st.PutObjectPart(ctx, q.bucket, q.key, id, n, body, storedLen, storage.PartOptions{})
 	if err != nil {
 		s.fail(q, err)
 		return
+	}
+	if dst != nil {
+		setSSEHeaders(q.w.Header(), dst.meta, dst.clientMD5)
 	}
 	s.writeXML(q, http.StatusOK, &copyPartResult{LastModified: isoTime(part.ModTime), ETag: `"` + part.ETag + `"`})
 }
@@ -274,6 +371,10 @@ func (s *Server) completeMultipartUpload(q *request) {
 		IfMatch:     q.r.Header.Get("If-Match"),
 		IfNoneMatch: q.r.Header.Get("If-None-Match"),
 	}
+	if err := s.checkEncryptedPartSizes(q, q.query.Get("uploadId"), parts); err != nil {
+		s.fail(q, err)
+		return
+	}
 	info, err := s.st.CompleteMultipartUpload(q.r.Context(), q.bucket, q.key, q.query.Get("uploadId"), parts, opts)
 	if err != nil {
 		s.fail(q, err)
@@ -283,6 +384,10 @@ func (s *Server) completeMultipartUpload(q *request) {
 	if q.r.TLS != nil {
 		scheme = "https"
 	}
+	if info.VersionID != "" {
+		q.w.Header().Set("x-amz-version-id", info.VersionID)
+	}
+	setSSEHeadersFromInfo(q.w.Header(), info.UserDefined)
 	s.writeXML(q, http.StatusOK, &completeMultipartUploadResult{
 		Location: scheme + "://" + q.r.Host + "/" + q.bucket + "/" + q.key,
 		Bucket:   q.bucket, Key: q.key, ETag: `"` + info.ETag + `"`,
@@ -349,9 +454,16 @@ func (s *Server) listParts(q *request) {
 		s.fail(q, err)
 		return
 	}
+	encrypted := sse.Encrypted(out.UserDefined)
 	for _, p := range out.Parts {
+		size := p.Size
+		if encrypted {
+			if n, err := sse.PlainSize(p.Size); err == nil {
+				size = n
+			}
+		}
 		res.Parts = append(res.Parts, partEntry{PartNumber: p.Number, LastModified: isoTime(p.ModTime),
-			ETag: `"` + p.ETag + `"`, Size: p.Size})
+			ETag: `"` + p.ETag + `"`, Size: size})
 	}
 	res.IsTruncated = out.IsTruncated
 	res.NextPartNumberMarker = out.NextPartNumberMarker
@@ -416,4 +528,49 @@ func (s *Server) listMultipartUploads(q *request) {
 	res.NextKeyMarker = p.enc(out.NextKeyMarker)
 	res.NextUploadIDMarker = out.NextUploadIDMarker
 	s.writeXML(q, http.StatusOK, &res)
+}
+
+// minPartSize is S3's minimum size of every part but the last.
+const minPartSize = 5 << 20
+
+// checkEncryptedPartSizes enforces S3's 5 MiB part minimum on the plaintext
+// size of an encrypted upload's parts. Storage only sees ciphertext, which
+// is slightly larger, so it can be more lenient than S3 but never stricter.
+func (s *Server) checkEncryptedPartSizes(q *request, id string, parts []storage.CompletePart) error {
+	ctx := q.r.Context()
+	first, err := s.st.ListObjectParts(ctx, q.bucket, q.key, id, storage.ListPartsOptions{PartNumberMarker: 1 << 30, MaxParts: 1})
+	if err != nil {
+		return err
+	}
+	if !sse.Encrypted(first.UserDefined) {
+		return nil
+	}
+	sizes := map[int]int64{}
+	marker := 0
+	for {
+		page, err := s.st.ListObjectParts(ctx, q.bucket, q.key, id, storage.ListPartsOptions{PartNumberMarker: marker, MaxParts: 1000})
+		if err != nil {
+			return err
+		}
+		for _, p := range page.Parts {
+			n, perr := sse.PlainSize(p.Size)
+			if perr != nil {
+				return errInternal
+			}
+			sizes[p.Number] = n
+		}
+		if !page.IsTruncated {
+			break
+		}
+		marker = page.NextPartNumberMarker
+	}
+	for i, p := range parts {
+		if i == len(parts)-1 {
+			break
+		}
+		if n, ok := sizes[p.Number]; ok && n < minPartSize {
+			return storage.Wrap(fmt.Errorf("%w: part %d is %d bytes; every part but the last must be at least %d", storage.ErrEntityTooSmall, p.Number, n, minPartSize), q.bucket, q.key)
+		}
+	}
+	return nil
 }

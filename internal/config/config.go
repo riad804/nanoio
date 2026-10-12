@@ -36,6 +36,19 @@ const (
 	EnvLockTimeout     = "NANOIO_LOCK_TIMEOUT"
 	EnvShutdownTimeout = "NANOIO_SHUTDOWN_TIMEOUT"
 
+	// Encryption at rest.
+	EnvKMSBackend        = "NANOIO_KMS_BACKEND"
+	EnvKMSDefaultKey     = "NANOIO_KMS_DEFAULT_KEY"
+	EnvKMSSecretKey      = "NANOIO_KMS_SECRET_KEY"
+	EnvKMSLocalKeyFile   = "NANOIO_KMS_LOCAL_KEY_FILE"
+	EnvKMSCacheTTL       = "NANOIO_KMS_CACHE_TTL"
+	EnvKMSKESEndpoint    = "NANOIO_KMS_KES_ENDPOINT"
+	EnvKMSKESAPIKey      = "NANOIO_KMS_KES_API_KEY"
+	EnvKMSKESCert        = "NANOIO_KMS_KES_CLIENT_CERT"
+	EnvKMSKESKey         = "NANOIO_KMS_KES_CLIENT_KEY"
+	EnvKMSKESCA          = "NANOIO_KMS_KES_CA"
+	EnvAllowInsecureSSEC = "NANOIO_ALLOW_INSECURE_SSEC"
+
 	// Distributed mode.
 	EnvNodeID           = "NANOIO_NODE_ID"
 	EnvClusterSecret    = "NANOIO_CLUSTER_SECRET"
@@ -119,6 +132,35 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// KMS configures the key management service behind SSE-S3 and SSE-KMS.
+// Backend "" disables them (SSE-C still works).
+type KMS struct {
+	// Backend is "", "local" or "kes".
+	Backend string `json:"backend"`
+	// DefaultKey is the key SSE-S3 uses and SSE-KMS defaults to. It must
+	// exist at startup.
+	DefaultKey string `json:"defaultKey"`
+	// CacheTTL bounds how long an unwrapped data key is kept in memory; 0
+	// disables the cache. CacheSize bounds its entries (default 10,000).
+	CacheTTL  Duration `json:"cacheTTL"`
+	CacheSize int      `json:"cacheSize"`
+	// Local holds KEKs in a file (and/or SecretKey): development only.
+	Local struct {
+		KeyFile string `json:"keyFile"`
+	} `json:"local"`
+	// SecretKey is "name:base64(32 bytes)", version 1 of a local key. Only
+	// from the environment, so it is not read from the config file.
+	SecretKey string `json:"-"`
+	// KES is the Key Encryption Service client.
+	KES struct {
+		Endpoint   string `json:"endpoint"`
+		APIKey     string `json:"apiKey"`
+		ClientCert string `json:"clientCert"`
+		ClientKey  string `json:"clientKey"`
+		CA         string `json:"ca"`
+	} `json:"kes"`
+}
+
 // Config is the server configuration.
 type Config struct {
 	// Root is the data directory served by the fs backend. Set exactly one
@@ -147,6 +189,11 @@ type Config struct {
 	RootPassword string `json:"rootPassword"`
 	// Cluster, when set, selects distributed mode.
 	Cluster *Cluster `json:"cluster"`
+	// KMS configures server-side encryption with managed keys.
+	KMS KMS `json:"kms"`
+	// AllowInsecureSSEC accepts SSE-C keys over connections that are not
+	// TLS. Off by default: the key travels in a header.
+	AllowInsecureSSEC bool `json:"allowInsecureSSEC"`
 	// IAMFile is the path of the users and policies document (optional).
 	IAMFile string `json:"iamFile"`
 	// InsecureNoAuth disables authentication and authorisation entirely.
@@ -182,6 +229,7 @@ func Default() Config {
 		UploadExpiry:    Duration(7 * 24 * time.Hour),
 		GCInterval:      Duration(time.Hour),
 		ShutdownTimeout: Duration(30 * time.Second),
+		KMS:             KMS{CacheTTL: Duration(5 * time.Minute)},
 	}
 }
 
@@ -296,6 +344,27 @@ func Load(path string, getenv func(string) string) (Config, error) {
 	if v := getenv(EnvLogLevel); v != "" {
 		cfg.LogLevel = v
 	}
+	for _, e := range []struct {
+		env string
+		dst *string
+	}{
+		{EnvKMSBackend, &cfg.KMS.Backend}, {EnvKMSDefaultKey, &cfg.KMS.DefaultKey},
+		{EnvKMSSecretKey, &cfg.KMS.SecretKey}, {EnvKMSLocalKeyFile, &cfg.KMS.Local.KeyFile},
+		{EnvKMSKESEndpoint, &cfg.KMS.KES.Endpoint}, {EnvKMSKESAPIKey, &cfg.KMS.KES.APIKey},
+		{EnvKMSKESCert, &cfg.KMS.KES.ClientCert}, {EnvKMSKESKey, &cfg.KMS.KES.ClientKey},
+		{EnvKMSKESCA, &cfg.KMS.KES.CA},
+	} {
+		if v := getenv(e.env); v != "" {
+			*e.dst = v
+		}
+	}
+	if v := getenv(EnvAllowInsecureSSEC); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("config: %s: %w", EnvAllowInsecureSSEC, err)
+		}
+		cfg.AllowInsecureSSEC = b
+	}
 	for _, d := range []struct {
 		env string
 		dst *Duration
@@ -304,6 +373,7 @@ func Load(path string, getenv func(string) string) (Config, error) {
 		{EnvUploadExpiry, &cfg.UploadExpiry},
 		{EnvGCInterval, &cfg.GCInterval},
 		{EnvShutdownTimeout, &cfg.ShutdownTimeout},
+		{EnvKMSCacheTTL, &cfg.KMS.CacheTTL},
 	} {
 		if v := getenv(d.env); v != "" {
 			parsed, err := time.ParseDuration(v)
@@ -427,6 +497,44 @@ func (c *Config) Finalize() error {
 	}
 	if c.ShutdownTimeout <= 0 {
 		return errors.New("config: shutdownTimeout must be positive")
+	}
+	return c.finalizeKMS()
+}
+
+func (c *Config) finalizeKMS() error {
+	k := &c.KMS
+	if k.CacheTTL < 0 {
+		return errors.New("config: kms.cacheTTL must not be negative (0 disables the cache)")
+	}
+	if k.CacheSize < 0 {
+		return errors.New("config: kms.cacheSize must not be negative")
+	}
+	switch k.Backend {
+	case "":
+		if k.DefaultKey != "" {
+			c.Warnings = append(c.Warnings, "kms.defaultKey is set but no kms.backend is configured: SSE-S3 and SSE-KMS are disabled")
+		}
+		return nil
+	case "local":
+		if k.Local.KeyFile == "" && k.SecretKey == "" {
+			return fmt.Errorf("config: kms backend local needs kms.local.keyFile or %s", EnvKMSSecretKey)
+		}
+		c.Warnings = append(c.Warnings, "kms backend \"local\" keeps key-encryption keys beside the data it protects: development use only")
+	case "kes":
+		if k.KES.Endpoint == "" {
+			return fmt.Errorf("config: kms backend kes needs kms.kes.endpoint (%s)", EnvKMSKESEndpoint)
+		}
+		if (k.KES.ClientCert == "") != (k.KES.ClientKey == "") {
+			return errors.New("config: kms.kes.clientCert and clientKey must be set together")
+		}
+		if k.KES.ClientCert == "" && k.KES.APIKey == "" {
+			return errors.New("config: kms backend kes needs a client certificate or an API key")
+		}
+	default:
+		return fmt.Errorf("config: kms.backend %q: must be \"local\" or \"kes\"", k.Backend)
+	}
+	if k.DefaultKey == "" {
+		return fmt.Errorf("config: kms.defaultKey is required with a kms backend (%s)", EnvKMSDefaultKey)
 	}
 	return nil
 }

@@ -20,6 +20,7 @@ import (
 
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/internal/listing"
+	"nanoio/internal/storage/internal/objlock"
 	"nanoio/internal/storage/xl"
 )
 
@@ -209,61 +210,92 @@ func (s *Store) draining(set int) bool { return s.pools[s.setPool[set]].Draining
 type found struct {
 	set  int
 	info storage.ObjectInfo
+	// dm is set when the version the lookup resolved to is a delete marker.
+	dm *storage.DeleteMarkerError
 }
 
-// find locates an object: on the ring's set first, then, when pools have
-// been added, on every other set. A set that cannot answer makes absence
-// unprovable, so its error is returned rather than "not found".
-func (s *Store) find(ctx context.Context, bucket, object string) (found, bool, error) {
-	first := s.ringSet(bucket, object)
-	if first >= 0 {
-		info, err := s.sets[first].StatObject(ctx, bucket, object, storage.GetOptions{})
+// absent reports whether err means "this set does not have it": no such
+// object, or no such version. A delete marker is not absence.
+func absent(err error) bool {
+	var dm *storage.DeleteMarkerError
+	if errors.As(err, &dm) {
+		return false
+	}
+	return errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, storage.ErrVersionNotFound)
+}
+
+// find locates an object (or the version in opts): on the ring's set first,
+// then, when pools have been added, on every other set. A set that cannot
+// answer makes absence unprovable, so its error is returned rather than
+// "not found". A delete marker counts as found: the key's history is there.
+func (s *Store) find(ctx context.Context, bucket, object string, opts storage.GetOptions) (found, bool, error) {
+	try := func(i int) (found, bool, error) {
+		info, err := s.sets[i].StatObject(ctx, bucket, object, opts)
+		var dm *storage.DeleteMarkerError
 		switch {
 		case err == nil:
-			return found{first, info}, true, nil
-		case !errors.Is(err, storage.ErrObjectNotFound):
-			return found{}, false, err
+			return found{set: i, info: info}, true, nil
+		case errors.As(err, &dm):
+			return found{set: i, dm: dm}, true, nil
+		case absent(err):
+			return found{}, false, nil
+		}
+		return found{}, false, err
+	}
+	first := s.ringSet(bucket, object)
+	if first >= 0 {
+		f, ok, err := try(first)
+		if ok || err != nil {
+			return f, ok, err
 		}
 	}
 	if !s.multi {
 		return found{}, false, nil
 	}
 	type res struct {
-		set  int
-		info storage.ObjectInfo
-		err  error
+		f   found
+		ok  bool
+		err error
 	}
 	var wg sync.WaitGroup
 	results := make([]res, len(s.sets))
-	for i, set := range s.sets {
+	for i := range s.sets {
 		if i == first {
-			results[i].err = storage.ErrObjectNotFound
 			continue
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			info, err := set.StatObject(ctx, bucket, object, storage.GetOptions{})
-			results[i] = res{i, info, err}
+			f, ok, err := try(i)
+			results[i] = res{f, ok, err}
 		}()
 	}
 	wg.Wait()
 	var best *found
 	var firstErr error
-	for i, r := range results {
+	for i := range results {
+		r := results[i]
 		switch {
-		case r.err == nil:
-			if best == nil || r.info.ModTime.After(best.info.ModTime) {
-				best = &found{i, r.info}
-			}
-		case !errors.Is(r.err, storage.ErrObjectNotFound) && firstErr == nil:
+		case r.err != nil && firstErr == nil:
 			firstErr = r.err
+		case r.ok:
+			if best == nil || foundTime(r.f).After(foundTime(*best)) {
+				c := r.f
+				best = &c
+			}
 		}
 	}
 	if best != nil {
 		return *best, true, nil
 	}
 	return found{}, false, firstErr
+}
+
+func foundTime(f found) time.Time {
+	if f.dm != nil {
+		return f.dm.ModTime
+	}
+	return f.info.ModTime
 }
 
 // target picks the set a write of bucket/object goes to, and the set (or
@@ -276,7 +308,7 @@ func (s *Store) target(ctx context.Context, bucket, object string) (target, stal
 		}
 		return ringSet, -1, nil, nil
 	}
-	f, ok, err := s.find(ctx, bucket, object)
+	f, ok, err := s.find(ctx, bucket, object, storage.GetOptions{})
 	if err != nil {
 		return 0, 0, nil, err
 	}
@@ -432,6 +464,12 @@ func (s *Store) DeleteBucket(ctx context.Context, bucket string, opts storage.De
 	} else if !ok {
 		return storage.Wrap(storage.ErrBucketNotFound, bucket, "")
 	}
+	// What a restored bucket must look like: one that had object lock comes
+	// back with it, never as an unprotected bucket.
+	lockCfg, err := s.GetBucketObjectLock(ctx, bucket)
+	if err != nil {
+		return err
+	}
 	var deleted []int
 	for i, set := range s.sets {
 		err := set.DeleteBucket(ctx, bucket, opts)
@@ -441,7 +479,11 @@ func (s *Store) DeleteBucket(ctx context.Context, bucket string, opts storage.De
 		case errors.Is(err, storage.ErrBucketNotFound):
 		default:
 			for _, j := range deleted {
-				s.sets[j].MakeBucket(context.Background(), bucket, storage.MakeBucketOptions{})
+				bg := context.Background()
+				s.sets[j].MakeBucket(bg, bucket, storage.MakeBucketOptions{ObjectLock: lockCfg.Enabled})
+				if lockCfg.Enabled && lockCfg.Default != nil {
+					s.sets[j].SetBucketObjectLock(bg, bucket, lockCfg)
+				}
 			}
 			return err
 		}
@@ -449,8 +491,203 @@ func (s *Store) DeleteBucket(ctx context.Context, bucket string, opts storage.De
 	return nil
 }
 
-// EnsureBuckets creates, on every set, the buckets that exist on another:
-// what brings a newly added pool in line.
+// GetBucketObjectLock reports the bucket's object lock configuration. Every
+// set holds it; if they have drifted (a change that reached only some sets)
+// the newest wins. Every set must answer, so an unreachable set can never
+// make a locked bucket read as unlocked.
+func (s *Store) GetBucketObjectLock(ctx context.Context, bucket string) (storage.ObjectLockConfig, error) {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return storage.ObjectLockConfig{}, err
+	}
+	cfgs := make([]storage.ObjectLockConfig, len(s.sets))
+	errs := s.fanOut(func(i int) error {
+		var err error
+		cfgs[i], err = s.sets[i].GetBucketObjectLock(ctx, bucket)
+		return err
+	})
+	missing := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+		case errors.Is(err, storage.ErrBucketNotFound):
+			missing++
+		default:
+			return storage.ObjectLockConfig{}, err
+		}
+	}
+	if missing == len(s.sets) {
+		return storage.ObjectLockConfig{}, storage.Wrap(storage.ErrBucketNotFound, bucket, "")
+	}
+	var best storage.ObjectLockConfig
+	have := false
+	for i, c := range cfgs {
+		if errs[i] != nil {
+			continue
+		}
+		// A set that has object lock beats one that does not at equal
+		// sequence: the unprotected reading is the dangerous one.
+		if !have || c.Seq > best.Seq || c.Seq == best.Seq && c.Enabled && !best.Enabled {
+			best, have = c, true
+		}
+	}
+	return best, nil
+}
+
+// SetBucketObjectLock changes the default retention on every set. A set
+// that fails leaves the sets ahead of it: the call reports the error and
+// EnsureBuckets brings the lagging sets to the newest configuration.
+func (s *Store) SetBucketObjectLock(ctx context.Context, bucket string, cfg storage.ObjectLockConfig) error {
+	cur, err := s.GetBucketObjectLock(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	if err := objlock.CheckConfig(cur, cfg); err != nil {
+		return storage.Wrap(err, bucket, "")
+	}
+	errs := s.fanOut(func(i int) error { return s.sets[i].SetBucketObjectLock(ctx, bucket, cfg) })
+	return firstErr(errs)
+}
+
+// reconcileObjectLock moves every set whose object lock configuration lags
+// the newest onto it.
+func (s *Store) reconcileObjectLock(ctx context.Context, bucket string) error {
+	best, err := s.GetBucketObjectLock(ctx, bucket)
+	if err != nil || !best.Enabled {
+		return err
+	}
+	var out []error
+	for i, set := range s.sets {
+		cur, err := set.GetBucketObjectLock(ctx, bucket)
+		switch {
+		case errors.Is(err, storage.ErrBucketNotFound):
+			continue
+		case err != nil:
+			out = append(out, fmt.Errorf("%s: %w", s.setID[i], err))
+			continue
+		case cur.Seq >= best.Seq && cur.Enabled:
+			continue
+		}
+		if err := set.SetBucketObjectLock(ctx, bucket, best); err != nil {
+			out = append(out, fmt.Errorf("%s: %w", s.setID[i], err))
+		}
+	}
+	return errors.Join(out...)
+}
+
+// setVersioning reads the bucket's versioning state on every set.
+func (s *Store) setVersioning(ctx context.Context, bucket string) ([]storage.VersioningConfig, []error) {
+	cfgs := make([]storage.VersioningConfig, len(s.sets))
+	errs := s.fanOut(func(i int) error {
+		var err error
+		cfgs[i], err = s.sets[i].GetBucketVersioning(ctx, bucket)
+		return err
+	})
+	return cfgs, errs
+}
+
+// newest picks the configuration that wins among sets: the highest change
+// sequence, and for equal sequences the more "active" state.
+func newest(cfgs []storage.VersioningConfig, errs []error) (storage.VersioningConfig, bool) {
+	rank := func(s storage.VersioningState) int {
+		switch s {
+		case storage.VersioningEnabled:
+			return 2
+		case storage.VersioningSuspended:
+			return 1
+		}
+		return 0
+	}
+	var best storage.VersioningConfig
+	have := false
+	for i, c := range cfgs {
+		if errs[i] != nil {
+			continue
+		}
+		if !have || c.Seq > best.Seq || c.Seq == best.Seq && rank(c.State) > rank(best.State) {
+			best, have = c, true
+		}
+	}
+	return best, have
+}
+
+// GetBucketVersioning reports the state of the bucket: every set holds it,
+// and if they have drifted (a change that reached only some sets) the
+// newest change wins. Every set must answer.
+func (s *Store) GetBucketVersioning(ctx context.Context, bucket string) (storage.VersioningConfig, error) {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return storage.VersioningConfig{}, err
+	}
+	cfgs, errs := s.setVersioning(ctx, bucket)
+	missing := 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+		case errors.Is(err, storage.ErrBucketNotFound):
+			missing++
+		default:
+			return storage.VersioningConfig{}, err
+		}
+	}
+	if missing == len(s.sets) {
+		return storage.VersioningConfig{}, storage.Wrap(storage.ErrBucketNotFound, bucket, "")
+	}
+	cfg, _ := newest(cfgs, errs)
+	return cfg, nil
+}
+
+// SetBucketVersioning changes the state on every set. A set that fails
+// leaves the sets ahead of it: the call reports the error, and the periodic
+// reconciliation (EnsureBuckets) brings the lagging sets to the newest
+// state.
+func (s *Store) SetBucketVersioning(ctx context.Context, bucket string, state storage.VersioningState) error {
+	cur, err := s.GetBucketVersioning(ctx, bucket)
+	if err != nil {
+		return err
+	}
+	if !state.Valid() {
+		return storage.Wrap(storage.ErrIllegalVersioning, bucket, "")
+	}
+	if err := storage.CheckVersioningTransition(cur.State, state); err != nil {
+		return storage.Wrap(err, bucket, "")
+	}
+	if state != storage.VersioningEnabled {
+		lock, err := s.GetBucketObjectLock(ctx, bucket)
+		if err != nil {
+			return err
+		}
+		if lock.Enabled {
+			return storage.Wrap(fmt.Errorf("%w: versioning cannot be suspended on a bucket with object lock", storage.ErrInvalidBucketState), bucket, "")
+		}
+	}
+	errs := s.fanOut(func(i int) error {
+		return s.sets[i].SetBucketVersioning(ctx, bucket, state)
+	})
+	return firstErr(errs)
+}
+
+// reconcileVersioning moves every set that lags the newest versioning
+// state of bucket onto it.
+func (s *Store) reconcileVersioning(ctx context.Context, bucket string) error {
+	cfgs, errs := s.setVersioning(ctx, bucket)
+	best, ok := newest(cfgs, errs)
+	if !ok {
+		return firstErr(errs)
+	}
+	var out []error
+	for i := range s.sets {
+		if errs[i] != nil || cfgs[i].State == best.State {
+			continue
+		}
+		if err := s.sets[i].SetBucketVersioning(ctx, bucket, best.State); err != nil {
+			out = append(out, fmt.Errorf("%s: %w", s.setID[i], err))
+		}
+	}
+	return errors.Join(out...)
+}
+
+// EnsureBuckets creates, on every set, the buckets that exist on another,
+// and brings their versioning state in line: what makes a newly added pool,
+// or a set that missed a change, consistent with the rest.
 func (s *Store) EnsureBuckets(ctx context.Context) error {
 	buckets, err := s.ListBuckets(ctx)
 	if err != nil {
@@ -458,6 +695,14 @@ func (s *Store) EnsureBuckets(ctx context.Context) error {
 	}
 	var errs []error
 	for _, b := range buckets {
+		// A set that lacks the bucket must get it with object lock if it
+		// has it elsewhere; creating it bare would accept unprotected
+		// writes. If that is not known the bucket is left alone.
+		lock, lerr := s.GetBucketObjectLock(ctx, b.Name)
+		if lerr != nil {
+			errs = append(errs, fmt.Errorf("bucket %s: %w", b.Name, lerr))
+			continue
+		}
 		for i, set := range s.sets {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -470,9 +715,15 @@ func (s *Store) EnsureBuckets(ctx context.Context) error {
 			if ok {
 				continue
 			}
-			if err := set.MakeBucket(ctx, b.Name, storage.MakeBucketOptions{}); err != nil && !errors.Is(err, storage.ErrBucketExists) {
+			if err := set.MakeBucket(ctx, b.Name, storage.MakeBucketOptions{ObjectLock: lock.Enabled}); err != nil && !errors.Is(err, storage.ErrBucketExists) {
 				errs = append(errs, fmt.Errorf("%s: %w", s.setID[i], err))
 			}
+		}
+		if err := s.reconcileVersioning(ctx, b.Name); err != nil {
+			errs = append(errs, err)
+		}
+		if err := s.reconcileObjectLock(ctx, b.Name); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -527,18 +778,23 @@ func (s *Store) GetObject(ctx context.Context, bucket, object string, opts stora
 	first := s.ringSet(bucket, object)
 	if first >= 0 {
 		rc, info, err := s.sets[first].GetObject(ctx, bucket, object, opts)
-		if err == nil || !errors.Is(err, storage.ErrObjectNotFound) || !s.multi {
+		if err == nil || !absent(err) || !s.multi {
 			return rc, info, err
 		}
 	} else if !s.multi {
 		return nil, storage.ObjectInfo{}, ErrNoPlacement
 	}
-	f, ok, err := s.find(ctx, bucket, object)
+	f, ok, err := s.find(ctx, bucket, object, opts)
 	switch {
 	case err != nil:
 		return nil, storage.ObjectInfo{}, err
 	case !ok:
+		if opts.VersionID != "" {
+			return nil, storage.ObjectInfo{}, storage.Wrap(storage.ErrVersionNotFound, bucket, object)
+		}
 		return nil, storage.ObjectInfo{}, storage.Wrap(storage.ErrObjectNotFound, bucket, object)
+	case f.dm != nil:
+		return nil, storage.ObjectInfo{}, f.dm
 	}
 	return s.sets[f.set].GetObject(ctx, bucket, object, opts)
 }
@@ -548,10 +804,7 @@ func (s *Store) StatObject(ctx context.Context, bucket, object string, opts stor
 	if err := validate(bucket, object); err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	if opts.VersionID != "" {
-		return storage.ObjectInfo{}, storage.Wrap(storage.ErrVersionNotFound, bucket, object)
-	}
-	f, ok, err := s.find(ctx, bucket, object)
+	f, ok, err := s.find(ctx, bucket, object, opts)
 	switch {
 	case err != nil:
 		return storage.ObjectInfo{}, err
@@ -559,31 +812,68 @@ func (s *Store) StatObject(ctx context.Context, bucket, object string, opts stor
 		if exists, berr := s.BucketExists(ctx, bucket); berr == nil && !exists {
 			return storage.ObjectInfo{}, storage.Wrap(storage.ErrBucketNotFound, bucket, "")
 		}
+		if opts.VersionID != "" {
+			return storage.ObjectInfo{}, storage.Wrap(storage.ErrVersionNotFound, bucket, object)
+		}
 		return storage.ObjectInfo{}, storage.Wrap(storage.ErrObjectNotFound, bucket, object)
+	case f.dm != nil:
+		return storage.ObjectInfo{}, f.dm
 	}
 	return f.info, nil
 }
 
-// DeleteObject removes the object from every set that has it.
+// DeleteObject removes an object, adds a delete marker, or removes one
+// version, on the set that holds the key:
+//
+//   - a named version is looked for on every set when there is more than
+//     one pool (it is wherever it was written), and removed there;
+//   - without a version, an unversioned bucket loses the object from every
+//     set that has it (as before versioning), while a versioned bucket gets
+//     its delete marker on the one set that holds the key, or on the ring's
+//     set for a key that has no history yet.
 func (s *Store) DeleteObject(ctx context.Context, bucket, object string, opts storage.DeleteOptions) (storage.DeleteResult, error) {
 	if err := validate(bucket, object); err != nil {
 		return storage.DeleteResult{}, err
 	}
+	first := s.ringSet(bucket, object)
 	if !s.multi {
-		first := s.ringSet(bucket, object)
 		if first < 0 {
 			return storage.DeleteResult{}, ErrNoPlacement
 		}
 		return s.sets[first].DeleteObject(ctx, bucket, object, opts)
 	}
+	versioned := opts.VersionID != ""
+	if !versioned && first >= 0 {
+		cfg, err := s.sets[first].GetBucketVersioning(ctx, bucket)
+		if err != nil {
+			return storage.DeleteResult{}, err
+		}
+		versioned = cfg.State != storage.VersioningUnversioned
+	}
+	if versioned && opts.VersionID == "" {
+		target, _, _, err := s.target(ctx, bucket, object)
+		if err != nil {
+			return storage.DeleteResult{}, err
+		}
+		return s.sets[target].DeleteObject(ctx, bucket, object, opts)
+	}
+	results := make([]storage.DeleteResult, len(s.sets))
 	errs := s.fanOut(func(i int) error {
-		_, err := s.sets[i].DeleteObject(ctx, bucket, object, opts)
+		var err error
+		results[i], err = s.sets[i].DeleteObject(ctx, bucket, object, opts)
 		return err
 	})
 	if err := firstErr(errs); err != nil {
 		return storage.DeleteResult{}, err
 	}
-	return storage.DeleteResult{}, nil
+	var out storage.DeleteResult
+	for _, r := range results {
+		if out.VersionID == "" {
+			out.VersionID = r.VersionID
+		}
+		out.DeleteMarker = out.DeleteMarker || r.DeleteMarker
+	}
+	return out, nil
 }
 
 // CopyObject and the other operations the sets do not implement report
@@ -592,12 +882,118 @@ func (s *Store) CopyObject(context.Context, storage.ObjectRef, storage.ObjectRef
 	return storage.ObjectInfo{}, fmt.Errorf("cluster: CopyObject: %w", storage.ErrNotImplemented)
 }
 
-func (s *Store) UpdateObjectMetadata(context.Context, string, string, storage.UpdateMetaOptions) (storage.ObjectInfo, error) {
-	return storage.ObjectInfo{}, fmt.Errorf("cluster: UpdateObjectMetadata: %w", storage.ErrNotImplemented)
+// UpdateObjectMetadata changes a version's metadata on the set that holds
+// it.
+func (s *Store) UpdateObjectMetadata(ctx context.Context, bucket, object string, opts storage.UpdateMetaOptions) (storage.ObjectInfo, error) {
+	set, err := s.setOf(ctx, storage.ObjectRef{Bucket: bucket, Object: object, VersionID: opts.VersionID})
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	return s.sets[set].UpdateObjectMetadata(ctx, bucket, object, opts)
 }
 
-func (s *Store) ListObjectVersions(context.Context, string, storage.ListOptions) (storage.ListVersionsResult, error) {
-	return storage.ListVersionsResult{}, fmt.Errorf("cluster: ListObjectVersions: %w", storage.ErrNotImplemented)
+// ListObjectVersions merges one page of versions from every set, under the
+// same per-set deadline and failure policy as ListObjects. Entries order by
+// key, then newest first (a key's versions live on one set; the order of
+// the rare key that has history on two is by modification time).
+func (s *Store) ListObjectVersions(ctx context.Context, bucket string, opts storage.ListOptions) (storage.ListVersionsResult, error) {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return storage.ListVersionsResult{}, err
+	}
+	limit := opts.MaxKeys
+	if limit <= 0 || limit > listing.MaxKeys {
+		limit = listing.MaxKeys
+	}
+	pageOpts := opts
+	pageOpts.MaxKeys = limit
+	pages := make([]storage.ListVersionsResult, len(s.sets))
+	errs := s.fanOut(func(i int) error {
+		cctx, cancel := context.WithTimeout(ctx, s.opts.ListTimeout)
+		defer cancel()
+		var err error
+		pages[i], err = s.sets[i].ListObjectVersions(cctx, bucket, pageOpts)
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			err = fmt.Errorf("%w: set %s did not answer within %v", storage.ErrBackendUnavailable, s.setID[i], s.opts.ListTimeout)
+		}
+		return err
+	})
+	if err := ctx.Err(); err != nil {
+		return storage.ListVersionsResult{}, err
+	}
+	missing, failed := 0, 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+		case errors.Is(err, storage.ErrBucketNotFound):
+			missing++
+		default:
+			failed++
+			s.log.Warn("cluster: version list could not use a set", "bucket", bucket, "set", s.setID[i], "err", err)
+		}
+	}
+	if missing == len(s.sets) {
+		return storage.ListVersionsResult{}, storage.Wrap(storage.ErrBucketNotFound, bucket, "")
+	}
+	if failed > 0 {
+		return storage.ListVersionsResult{}, storage.Wrap(
+			fmt.Errorf("%w: %d of %d sets could not be listed", storage.ErrBackendUnavailable, failed, len(s.sets)), bucket, "")
+	}
+	type entry struct {
+		key    string
+		prefix bool
+		v      storage.ObjectInfo
+	}
+	var all []entry
+	seenPrefix := map[string]bool{}
+	truncated := false
+	for _, p := range pages {
+		truncated = truncated || p.IsTruncated
+		for _, pre := range p.Prefixes {
+			if !seenPrefix[pre] {
+				seenPrefix[pre] = true
+				all = append(all, entry{key: pre, prefix: true})
+			}
+		}
+		for _, v := range p.Versions {
+			all = append(all, entry{key: v.Name, v: v})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool {
+		a, b := all[i], all[j]
+		switch {
+		case a.key != b.key:
+			return a.key < b.key
+		case a.prefix != b.prefix:
+			return a.prefix
+		case !a.v.ModTime.Equal(b.v.ModTime):
+			return a.v.ModTime.After(b.v.ModTime)
+		}
+		return a.v.VersionID > b.v.VersionID
+	})
+	var res storage.ListVersionsResult
+	if len(all) > limit {
+		all, truncated = all[:limit], true
+	}
+	for i, e := range all {
+		if e.prefix {
+			res.Prefixes = append(res.Prefixes, e.key)
+			continue
+		}
+		// Only the first entry of a key is its latest.
+		if i > 0 && !all[i-1].prefix && all[i-1].key == e.key {
+			e.v.IsLatest = false
+		}
+		res.Versions = append(res.Versions, e.v)
+	}
+	res.IsTruncated = truncated
+	if truncated && len(all) > 0 {
+		last := all[len(all)-1]
+		res.NextMarker = last.key
+		if !last.prefix {
+			res.NextVersionIDMarker = last.v.VersionID
+		}
+	}
+	return res, nil
 }
 
 // ListObjects merges one page from every set. See the package contract for
@@ -852,4 +1248,48 @@ func (s *Store) Scan(ctx context.Context, deep bool) (xl.ScanStats, error) {
 		sum.Staging += st.Staging
 	}
 	return sum, nil
+}
+
+// setOf finds the set holding one version of an object, with the errors a
+// read of it would give.
+func (s *Store) setOf(ctx context.Context, ref storage.ObjectRef) (int, error) {
+	if err := validate(ref.Bucket, ref.Object); err != nil {
+		return 0, err
+	}
+	f, ok, err := s.find(ctx, ref.Bucket, ref.Object, storage.GetOptions{VersionID: ref.VersionID})
+	switch {
+	case err != nil:
+		return 0, err
+	case !ok:
+		if exists, berr := s.BucketExists(ctx, ref.Bucket); berr == nil && !exists {
+			return 0, storage.Wrap(storage.ErrBucketNotFound, ref.Bucket, "")
+		}
+		if ref.VersionID != "" {
+			return 0, storage.Wrap(storage.ErrVersionNotFound, ref.Bucket, ref.Object)
+		}
+		return 0, storage.Wrap(storage.ErrObjectNotFound, ref.Bucket, ref.Object)
+	case f.dm != nil:
+		return 0, f.dm
+	}
+	return f.set, nil
+}
+
+// SetObjectRetention changes the retention on the set that holds the
+// version.
+func (s *Store) SetObjectRetention(ctx context.Context, ref storage.ObjectRef, r storage.Retention, opts storage.RetentionOptions) (storage.ObjectInfo, error) {
+	set, err := s.setOf(ctx, ref)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	return s.sets[set].SetObjectRetention(ctx, ref, r, opts)
+}
+
+// SetObjectLegalHold changes the legal hold on the set that holds the
+// version.
+func (s *Store) SetObjectLegalHold(ctx context.Context, ref storage.ObjectRef, on bool) (storage.ObjectInfo, error) {
+	set, err := s.setOf(ctx, ref)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	return s.sets[set].SetObjectLegalHold(ctx, ref, on)
 }

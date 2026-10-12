@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"nanoio/internal/auth"
+	"nanoio/internal/kms"
+	"nanoio/internal/sse"
 	"nanoio/internal/storage"
 )
 
@@ -164,9 +167,6 @@ func parseBody(r *http.Request, res *auth.Result) (*bodyInfo, error) {
 }
 
 func parsePut(r *http.Request, res *auth.Result) (*putRequest, error) {
-	if r.Header.Get("x-amz-copy-source") != "" {
-		return nil, notImplemented("CopyObject (x-amz-copy-source)")
-	}
 	opts, err := parseObjectMeta(r.Header)
 	if err != nil {
 		return nil, err
@@ -185,18 +185,69 @@ func (s *Server) putObject(q *request) {
 	if !s.authorize(q, "s3:PutObject", q.bucket, q.key, nil) {
 		return
 	}
+	if q.r.Header.Get("x-amz-copy-source") != "" {
+		s.copyObject(q)
+		return
+	}
 	p, err := parsePut(q.r, q.res)
 	if err != nil {
 		s.fail(q, err)
 		return
 	}
-	info, err := s.st.PutObject(q.r.Context(), q.bucket, q.key, p.body, p.size, p.opts)
+	lock, aerr := parseLockHeaders(q.r.Header)
+	if aerr != nil {
+		s.fail(q, aerr)
+		return
+	}
+	if !s.authorizeLockHeaders(q, lock) {
+		return
+	}
+	p.opts.Retention, p.opts.LegalHold = lock.retention, lock.hold
+	spec, err := s.writeSpec(q, q.bucket)
 	if err != nil {
 		s.fail(q, err)
 		return
 	}
-	q.w.Header()["ETag"] = []string{`"` + info.ETag + `"`}
+	body, size := p.body, p.size
+	var (
+		finish func() string
+		meta   *sse.Meta
+	)
+	if spec != nil {
+		defer kms.Zero(spec.clientKey)
+		body, size, finish, meta, err = s.encryptedBody(q, spec, q.bucket+"/"+q.key, p.body, p.size, &p.opts)
+		if err != nil {
+			s.fail(q, err)
+			return
+		}
+	}
+	info, err := s.st.PutObject(q.r.Context(), q.bucket, q.key, body, size, p.opts)
+	if err != nil {
+		s.fail(q, err)
+		return
+	}
+	etag := info.ETag
+	if finish != nil {
+		etag = finish()
+	}
+	h := q.w.Header()
+	h["ETag"] = []string{`"` + etag + `"`}
+	if info.VersionID != "" {
+		h.Set("x-amz-version-id", info.VersionID)
+	}
+	if meta != nil {
+		setSSEHeaders(h, meta, ssecKeyMD5(spec))
+	}
 	q.w.WriteHeader(http.StatusOK)
+}
+
+// ssecKeyMD5 is the base64 MD5 of an SSE-C spec's key, for response headers.
+func ssecKeyMD5(spec *sseSpec) string {
+	if spec == nil || spec.mode != sse.ModeC {
+		return ""
+	}
+	sum := md5.Sum(spec.clientKey)
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 func (s *Server) deleteObject(q *request) {
@@ -207,12 +258,25 @@ func (s *Server) deleteObject(q *request) {
 	if !s.authorize(q, action, q.bucket, q.key, nil) {
 		return
 	}
-	_, err := s.st.DeleteObject(q.r.Context(), q.bucket, q.key, storage.DeleteOptions{
-		VersionID: q.query.Get("versionId"),
+	bypass, ok := s.bypassGovernance(q, q.key)
+	if !ok {
+		return
+	}
+	res, err := s.st.DeleteObject(q.r.Context(), q.bucket, q.key, storage.DeleteOptions{
+		VersionID:        q.query.Get("versionId"),
+		BypassGovernance: bypass,
 	})
 	if err != nil {
+		s.logLockRefusal(q, "delete", err)
 		s.fail(q, err)
 		return
+	}
+	h := q.w.Header()
+	if res.VersionID != "" {
+		h.Set("x-amz-version-id", res.VersionID)
+	}
+	if res.DeleteMarker {
+		h.Set("x-amz-delete-marker", "true")
 	}
 	q.w.WriteHeader(http.StatusNoContent)
 }
@@ -238,6 +302,7 @@ func objectHeaders(h http.Header, info storage.ObjectInfo) {
 	if info.VersionID != "" {
 		h.Set("x-amz-version-id", info.VersionID)
 	}
+	lockResponseHeaders(h, info)
 }
 
 // etagMatches implements the entity-tag list comparison of If-Match and
@@ -257,10 +322,13 @@ func etagMatches(header, etag string) bool {
 }
 
 // checkConditions applies RFC 7232 precedence for GET and HEAD.
-func checkConditions(h http.Header, info storage.ObjectInfo) *APIError {
+func checkConditions(h http.Header, info storage.ObjectInfo, alt string) *APIError {
 	mod := info.ModTime.UTC().Truncate(time.Second)
+	// matches also accepts alt: for an encrypted object, the stored ETag
+	// that listings show next to the plaintext one GET reports.
+	matches := func(v string) bool { return etagMatches(v, info.ETag) || (alt != "" && etagMatches(v, alt)) }
 	if v := h.Get("If-Match"); v != "" {
-		if !etagMatches(v, info.ETag) {
+		if !matches(v) {
 			return errPrecondition
 		}
 	} else if v := h.Get("If-Unmodified-Since"); v != "" {
@@ -269,7 +337,7 @@ func checkConditions(h http.Header, info storage.ObjectInfo) *APIError {
 		}
 	}
 	if v := h.Get("If-None-Match"); v != "" {
-		if etagMatches(v, info.ETag) {
+		if matches(v) {
 			return errNotModified
 		}
 	} else if v := h.Get("If-Modified-Since"); v != "" {
@@ -328,12 +396,21 @@ func parseRange(header string, size int64) (start, length int64, partial bool, e
 // getObject serves GET and HEAD. It opens the object once and applies the
 // range to that open snapshot, so the range always refers to the bytes and
 // size the response describes even if the key is overwritten meanwhile.
+//
+// An encrypted object is unsealed before any header is written (so a wrong
+// key or an unavailable KMS is a proper error response), reported with its
+// plaintext size and ETag, and read through a decrypter that seeks to just
+// the chunks the range covers.
 func (s *Server) getObject(q *request, head bool) {
 	action := "s3:GetObject"
 	if q.query.Get("versionId") != "" {
 		action = "s3:GetObjectVersion"
 	}
 	if !s.authorize(q, action, q.bucket, q.key, nil) {
+		return
+	}
+	if aerr := rejectSSEOnRead(q.r.Header); aerr != nil {
+		s.fail(q, aerr)
 		return
 	}
 	ctx := q.r.Context()
@@ -357,13 +434,28 @@ func (s *Server) getObject(q *request, head bool) {
 		defer rc.Close()
 	}
 
+	enc, err := s.openEncrypted(q, info, ssecPrefix)
+	if err != nil {
+		s.fail(q, err)
+		return
+	}
+	defer enc.close()
+	size, alt := info.Size, ""
+	if enc != nil {
+		size, alt = enc.size, enc.storedTag
+		info.Size, info.ETag = enc.size, enc.etag
+	}
+
 	h := q.w.Header()
 	objectHeaders(h, info)
-	if cerr := checkConditions(q.r.Header, info); cerr != nil {
+	if enc != nil {
+		setSSEHeaders(h, enc.meta, enc.clientMD5)
+	}
+	if cerr := checkConditions(q.r.Header, info, alt); cerr != nil {
 		s.writeAPIError(q, cerr)
 		return
 	}
-	start, length, partial, rerr := parseRange(q.r.Header.Get("Range"), info.Size)
+	start, length, partial, rerr := parseRange(q.r.Header.Get("Range"), size)
 	if rerr != nil {
 		s.writeAPIError(q, rerr)
 		return
@@ -372,16 +464,23 @@ func (s *Server) getObject(q *request, head bool) {
 	if partial {
 		status = http.StatusPartialContent
 		h.Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+
-			strconv.FormatInt(start+length-1, 10)+"/"+strconv.FormatInt(info.Size, 10))
+			strconv.FormatInt(start+length-1, 10)+"/"+strconv.FormatInt(size, 10))
 	} else {
-		length = info.Size
+		length = size
 	}
 	h.Set("Content-Length", strconv.FormatInt(length, 10))
 	q.w.WriteHeader(status)
 	if head || length == 0 {
 		return
 	}
-	if start > 0 {
+	var body io.Reader = rc
+	if enc != nil {
+		body, err = sse.NewDecrypter(rc, enc.layout, enc.key, start, length)
+		if err != nil {
+			s.log.Error("cannot open decrypter", "id", q.id, "bucket", q.bucket, "key", q.key, "err", err)
+			panic(http.ErrAbortHandler)
+		}
+	} else if start > 0 {
 		if sk, ok := rc.(io.Seeker); ok {
 			_, err = sk.Seek(start, io.SeekStart)
 		} else {
@@ -392,7 +491,7 @@ func (s *Server) getObject(q *request, head bool) {
 			panic(http.ErrAbortHandler)
 		}
 	}
-	if _, err := io.CopyN(q.w, rc, length); err != nil {
+	if _, err := io.CopyN(q.w, body, length); err != nil {
 		// Headers are out; the only honest signal left is to cut the
 		// connection so the client sees a short body.
 		s.log.Warn("response body truncated", "id", q.id, "bucket", q.bucket, "key", q.key, "err", err)

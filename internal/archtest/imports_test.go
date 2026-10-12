@@ -48,6 +48,10 @@ func TestImportRules(t *testing.T) {
 		{"internal/config", []string{""}},
 		{"internal/storage/internal/fsutil", []string{""}},
 		{"internal/meta", []string{""}},
+		// Encryption: kms is standard library only; sse builds on kms alone,
+		// so key handling can never reach into storage, HTTP or auth.
+		{"internal/kms", []string{""}},
+		{"internal/sse", []string{"internal/api", "internal/auth", "internal/iam", "internal/bucket", "internal/storage", "internal/cluster"}},
 		{"internal/storage", []string{""}},
 	}
 	for _, tt := range tests {

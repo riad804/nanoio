@@ -97,10 +97,14 @@ type Options struct {
 	// finished once the write quorum has: they are then dropped from the
 	// write and repaired by heal. 0 means 500ms; negative means do not wait.
 	StragglerGrace time.Duration
-	// WriteQueue is how many erasure blocks may be queued for one drive
-	// before a lagging drive is dropped from an in-flight write (when the
-	// quorum can spare it). 0 means 8.
+	// WriteQueue is how many erasure blocks may be queued for one drive. A
+	// full queue holds the write back, since every drive is slower than
+	// memory; 0 means 8.
 	WriteQueue int
+	// WriteStallTimeout is how long a write waits for room in one drive's
+	// full queue before dropping that drive from the write (when the
+	// quorum can spare it). 0 means 2s.
+	WriteStallTimeout time.Duration
 	// Fault, when non-nil, is called at named commit points with the drive
 	// index; an error is treated as that drive's failure. For tests only.
 	// It applies to the local drives New creates; drives handed to
@@ -136,6 +140,7 @@ type XL struct {
 
 	stragglerGrace time.Duration
 	writeQueue     int
+	stallTimeout   time.Duration
 
 	minPartSize  int64
 	uploadExpiry time.Duration
@@ -150,6 +155,47 @@ type XL struct {
 	scanDone   chan struct{}
 
 	corrupted atomic.Int64
+
+	verMu    sync.Mutex
+	verCache map[string]cachedVersioning
+}
+
+// cachedVersioning is a bucket's versioning state as last seen, used only
+// to decide how version IDs are reported on reads. Writes always read the
+// state under the bucket lock.
+type cachedVersioning struct {
+	cfg storage.VersioningConfig
+	at  time.Time
+}
+
+const versioningCacheTTL = 2 * time.Second
+
+// reportState returns the bucket's versioning state for reporting version
+// IDs. It may be a couple of seconds old; if it cannot be read the bucket
+// reports as unversioned (the version ID header is merely omitted).
+func (x *XL) reportState(ctx context.Context, bucket string) storage.VersioningState {
+	x.verMu.Lock()
+	c, ok := x.verCache[bucket]
+	x.verMu.Unlock()
+	if ok && time.Since(c.at) < versioningCacheTTL {
+		return c.cfg.State
+	}
+	v, err := x.versioning(ctx, bucket)
+	if err != nil {
+		return c.cfg.State
+	}
+	x.noteVersioning(bucket, v.cfg)
+	return v.cfg.State
+}
+
+// noteVersioning records a freshly read or written state.
+func (x *XL) noteVersioning(bucket string, cfg storage.VersioningConfig) {
+	x.verMu.Lock()
+	if x.verCache == nil {
+		x.verCache = map[string]cachedVersioning{}
+	}
+	x.verCache[bucket] = cachedVersioning{cfg, time.Now()}
+	x.verMu.Unlock()
 }
 
 var _ storage.StorageAPI = (*XL)(nil)
@@ -226,6 +272,10 @@ func NewWithDisks(ctx context.Context, disks []disk.Disk, opts Options) (*XL, er
 	}
 	if x.writeQueue <= 0 {
 		x.writeQueue = 8
+	}
+	x.stallTimeout = opts.WriteStallTimeout
+	if x.stallTimeout <= 0 {
+		x.stallTimeout = 2 * time.Second
 	}
 	if x.minPartSize <= 0 {
 		x.minPartSize = 5 << 20
@@ -405,6 +455,91 @@ func (x *XL) each(ctx context.Context, fn func(d *drive) error) []error {
 	}
 	wg.Wait()
 	return errs
+}
+
+// scatter runs fn on every drive concurrently and returns once need of them
+// have succeeded and grace has passed for the rest (grace <= 0 returns at
+// once), or, with giveUp set, as soon as need can no longer be reached. The
+// calls carry on after scatter returns (detached from ctx when detach is set); a success
+// that arrives late is handed to late (which may be nil) so it can be
+// cleaned up or completed. Drives that had not answered report
+// errStraggler. Drives that are not ready report errDriveOffline.
+func scatter[T any](ctx context.Context, x *XL, need int, grace time.Duration, giveUp, detach bool,
+	fn func(ctx context.Context, d *drive) (T, error), late func(i int, v T)) ([]T, []error) {
+	n := len(x.drives)
+	// With detach set the calls outlive the request (cleanup-like work whose
+	// results are plain values). Without it they run under ctx itself, for
+	// calls that return objects bound to their context, such as writers.
+	cctx, cancel := ctx, context.CancelFunc(func() {})
+	if detach {
+		cctx, cancel = detached(ctx)
+	}
+	type answer struct {
+		i   int
+		v   T
+		err error
+	}
+	ch := make(chan answer, n)
+	for i, d := range x.drives {
+		go func() {
+			var zero T
+			if !d.Ready(cctx) {
+				ch <- answer{i, zero, errDriveOffline}
+				return
+			}
+			v, err := fn(cctx, d)
+			ch <- answer{i, v, err}
+		}()
+	}
+	vals := make([]T, n)
+	errs := make([]error, n)
+	seen := make([]bool, n)
+	got, ok := 0, 0
+	var graceC <-chan time.Time
+loop:
+	for got < n {
+		if ok >= need && graceC == nil {
+			if grace <= 0 {
+				break
+			}
+			t := time.NewTimer(grace)
+			defer t.Stop()
+			graceC = t.C
+		}
+		if giveUp && ok+(n-got) < need {
+			break
+		}
+		select {
+		case a := <-ch:
+			got++
+			seen[a.i] = true
+			vals[a.i], errs[a.i] = a.v, a.err
+			if a.err == nil {
+				ok++
+			}
+		case <-graceC:
+			break loop
+		}
+	}
+	if got == n {
+		cancel()
+		return vals, errs
+	}
+	for i := range errs {
+		if !seen[i] {
+			errs[i] = errStraggler
+		}
+	}
+	remaining := n - got
+	go func() {
+		defer cancel()
+		for k := 0; k < remaining; k++ {
+			if a := <-ch; a.err == nil && late != nil {
+				late(a.i, a.v)
+			}
+		}
+	}()
+	return vals, errs
 }
 
 func countNil(errs []error) int {

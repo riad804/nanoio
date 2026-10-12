@@ -101,6 +101,12 @@ var storageErrors = []struct {
 	{storage.ErrBackendUnavailable, APIError{"ServiceUnavailable", "The service is unavailable. Please retry.", 503}},
 	{storage.ErrDiskFull, APIError{"XNanoIOStorageFull", "Storage backend has reached its minimum free drive threshold.", 507}},
 	{storage.ErrCorrupted, APIError{"InternalError", "We encountered an internal error. Please try again.", 500}},
+	{storage.ErrInvalidVersionID, APIError{"InvalidArgument", "Invalid version id specified", 400}},
+	{storage.ErrIllegalVersioning, APIError{"IllegalVersioningConfigurationException", "The versioning configuration specified in the request is invalid.", 400}},
+	{storage.ErrObjectLocked, APIError{"AccessDenied", "Access Denied because object protected by object lock.", 403}},
+	{storage.ErrObjectLockNotEnabled, APIError{"InvalidRequest", "Bucket is missing Object Lock Configuration", 400}},
+	{storage.ErrInvalidRetention, APIError{"InvalidArgument", "The retention is not valid.", 400}},
+	{storage.ErrInvalidBucketState, APIError{"InvalidBucketState", "The request is not valid with the current state of the bucket.", 409}},
 	{storage.ErrNotImplemented, APIError{"NotImplemented", "A header you provided implies functionality that is not implemented.", 501}},
 }
 
@@ -110,6 +116,7 @@ var storageErrors = []struct {
 var detailSafe = map[error]bool{
 	storage.ErrInvalidBucketName: true, storage.ErrInvalidObjectName: true, storage.ErrKeyTooLong: true,
 	storage.ErrInvalidPart: true, storage.ErrInvalidPartOrder: true, storage.ErrEntityTooSmall: true,
+	storage.ErrInvalidRetention: true, storage.ErrInvalidBucketState: true,
 }
 
 // classify turns any error into the APIError to send. The second result is

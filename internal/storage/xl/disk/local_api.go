@@ -242,3 +242,37 @@ func (d *Local) SweepStaging(ctx context.Context, maxAge time.Duration) (int, er
 	}
 	return d.sweepStaging(maxAge), nil
 }
+
+// ReadBucketVersioning implements Disk.
+func (d *Local) ReadBucketVersioning(ctx context.Context, bucket string) (string, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return "", 0, Wrap("ReadBucketVersioning", bucket, err)
+	}
+	st, seq, err := d.readBucketVersioning(bucket)
+	return st, seq, Wrap("ReadBucketVersioning", bucket, err)
+}
+
+// WriteBucketVersioning implements Disk.
+func (d *Local) WriteBucketVersioning(ctx context.Context, bucket, state string, seq uint64) error {
+	if err := ctx.Err(); err != nil {
+		return Wrap("WriteBucketVersioning", bucket, err)
+	}
+	return Wrap("WriteBucketVersioning", bucket, d.writeBucketVersioning(bucket, state, seq))
+}
+
+// ReadBucketSettings implements Disk.
+func (d *Local) ReadBucketSettings(ctx context.Context, bucket string) (BucketSettings, error) {
+	if err := ctx.Err(); err != nil {
+		return BucketSettings{}, Wrap("ReadBucketSettings", bucket, err)
+	}
+	r0, err := d.readBucketSettings(bucket)
+	return r0, Wrap("ReadBucketSettings", bucket, err)
+}
+
+// WriteBucketObjectLock implements Disk.
+func (d *Local) WriteBucketObjectLock(ctx context.Context, bucket, doc string, seq uint64) error {
+	if err := ctx.Err(); err != nil {
+		return Wrap("WriteBucketObjectLock", bucket, err)
+	}
+	return Wrap("WriteBucketObjectLock", bucket, d.writeBucketObjectLock(bucket, doc, seq))
+}

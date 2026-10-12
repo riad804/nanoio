@@ -17,6 +17,7 @@ func TestSlowNodeDoesNotStallWrites(t *testing.T) {
 	tn := newThreeNodesWith(t, func(o *Options) {
 		o.StragglerGrace = 100 * time.Millisecond
 		o.WriteQueue = 2
+		o.WriteStallTimeout = 150 * time.Millisecond
 	})
 	x := tn.x
 	mkbucket(t, x, "slow")
@@ -47,7 +48,7 @@ func TestSlowNodeDoesNotStallWrites(t *testing.T) {
 
 	// The object is whole, and heal converges the drives that missed it.
 	tn.net.Heal()
-	settle()
+	waitOnline(t, x, 6)
 	if got := mustRead(t, x, "slow", "big"); got != body {
 		t.Fatal("object differs after a write that left stragglers")
 	}
@@ -55,10 +56,7 @@ func TestSlowNodeDoesNotStallWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, key := range []string{"warm", "big"} {
-		res, err := x.HealObject(bg, "slow", key, true)
-		if err != nil || res.Skipped != "healthy" {
-			t.Errorf("%s after scan: %+v, %v", key, res, err)
-		}
+		eventuallyHealthy(t, x, "slow", key)
 	}
 }
 
@@ -95,14 +93,12 @@ func TestLateCommitCannotUndoANewerWrite(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		gens[f.Latest().Generation]++
+		gens[f.Generation()]++
 	}
 	if len(gens) != 1 || gens[3] != len(x.drives) {
 		t.Errorf("drives hold generations %v; every drive should be at 3", gens)
 	}
-	if res, err := x.HealObject(bg, "late", "k", true); err != nil || res.Skipped != "healthy" {
-		t.Errorf("heal: %+v, %v", res, err)
-	}
+	eventuallyHealthy(t, x, "late", "k")
 }
 
 // A quorum that cannot be met still fails, and cleanly, even though writers
@@ -119,7 +115,7 @@ func TestWriteFailsWhenQuorumIsLostMidStream(t *testing.T) {
 		t.Fatal("a write with 2 of 6 drives succeeded")
 	}
 	tn.net.Heal()
-	settle()
+	waitOnline(t, x, 6)
 	if _, err := x.StatObject(bg, "lost", "k", storage.GetOptions{}); err == nil {
 		t.Error("a refused write left an object behind")
 	}
@@ -134,6 +130,7 @@ func TestEvictedWritersDoNotLeakGoroutines(t *testing.T) {
 	tn := newThreeNodesWith(t, func(o *Options) {
 		o.StragglerGrace = 20 * time.Millisecond
 		o.WriteQueue = 1
+		o.WriteStallTimeout = 50 * time.Millisecond
 	})
 	x := tn.x
 	mkbucket(t, x, "leak")
@@ -153,4 +150,22 @@ func countWriterGoroutines() int {
 	buf := make([]byte, 1<<20)
 	n := runtimeStack(buf)
 	return strings.Count(string(buf[:n]), "(*shardWriter).run")
+}
+
+// eventuallyHealthy runs deep heals until the object needs none. A queued
+// background repair may be running at the same time, so the first call is
+// not necessarily the one that finds nothing to do.
+func eventuallyHealthy(t *testing.T, x *XL, bucket, key string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		res, err := x.HealObject(bg, bucket, key, true)
+		if err == nil && res.Skipped == "healthy" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s/%s never became healthy: %+v, %v", bucket, key, res, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

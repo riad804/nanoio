@@ -12,7 +12,3 @@ import (
 func (f *FS) CopyObject(context.Context, storage.ObjectRef, storage.ObjectRef, storage.CopyOptions) (storage.ObjectInfo, error) {
 	return storage.ObjectInfo{}, notImpl("CopyObject")
 }
-
-func (f *FS) UpdateObjectMetadata(context.Context, string, string, storage.UpdateMetaOptions) (storage.ObjectInfo, error) {
-	return storage.ObjectInfo{}, notImpl("UpdateObjectMetadata")
-}

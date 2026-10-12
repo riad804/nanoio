@@ -53,6 +53,17 @@ func (s *Store) drainSet(ctx context.Context, g int, st *DrainStats) error {
 		return err
 	}
 	for _, b := range buckets {
+		// Moving an object copies its latest version only; the older
+		// versions and delete markers of a versioned key would be left
+		// behind and then lost with the source copy. Draining such a pool
+		// needs a way to import a version under its existing ID.
+		cfg, err := src.GetBucketVersioning(ctx, b.Name)
+		if err != nil {
+			return err
+		}
+		if cfg.State != storage.VersioningUnversioned {
+			return fmt.Errorf("cluster: bucket %s is %s; draining a pool that holds versioned objects is not supported", b.Name, strings.ToLower(string(cfg.State)))
+		}
 		ups, err := src.ListMultipartUploads(ctx, b.Name, storage.ListUploadsOptions{MaxUploads: 1})
 		if err != nil {
 			return err
@@ -106,9 +117,16 @@ func (s *Store) moveObject(ctx context.Context, from int, bucket string, o stora
 		return false, 0, err
 	}
 	defer rc.Close()
-	put, err := s.sets[dst].PutObject(ctx, bucket, o.Name, rc, info.Size, storage.PutOptions{
-		ContentType: info.ContentType, UserDefined: info.UserDefined, IfNoneMatch: "*",
-	})
+	opts := storage.PutOptions{ContentType: info.ContentType, UserDefined: info.UserDefined, IfNoneMatch: "*"}
+	var put storage.ObjectInfo
+	if len(info.Parts) > 1 {
+		// A multipart object moves as a multipart object, part for part:
+		// the part layout is part of what an encrypted object's ciphertext
+		// means, and it keeps the ETag.
+		put, err = s.movePartwise(ctx, dst, bucket, o.Name, rc, info, opts)
+	} else {
+		put, err = s.sets[dst].PutObject(ctx, bucket, o.Name, rc, info.Size, opts)
+	}
 	switch {
 	case errors.Is(err, storage.ErrPreconditionFailed):
 		// The destination already has a version: a client wrote it after
@@ -118,9 +136,7 @@ func (s *Store) moveObject(ctx context.Context, from int, bucket string, o stora
 		return false, 0, err
 	default:
 		copied, n = true, put.Size
-		// Single-part objects keep their ETag; a multipart ETag is
-		// necessarily replaced by the content MD5.
-		if !strings.Contains(info.ETag, "-") && put.ETag != info.ETag {
+		if put.ETag != info.ETag {
 			s.sets[dst].DeleteObject(ctx, bucket, o.Name, storage.DeleteOptions{})
 			return false, 0, fmt.Errorf("destination ETag %s differs from source %s", put.ETag, info.ETag)
 		}
@@ -130,4 +146,35 @@ func (s *Store) moveObject(ctx context.Context, from int, bucket string, o stora
 		return copied, n, fmt.Errorf("copied but could not remove the source: %w", err)
 	}
 	return copied, n, nil
+}
+
+// movePartwise copies a multipart object to set dst as an upload with the
+// source's part numbers and sizes, so the destination object has the same
+// parts and the same composite ETag.
+func (s *Store) movePartwise(ctx context.Context, dst int, bucket, object string, rc io.Reader, info storage.ObjectInfo, opts storage.PutOptions) (storage.ObjectInfo, error) {
+	set := s.sets[dst]
+	id, err := set.NewMultipartUpload(ctx, bucket, object, storage.PutOptions{ContentType: opts.ContentType, UserDefined: opts.UserDefined})
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	abort := func() { set.AbortMultipartUpload(context.WithoutCancel(ctx), bucket, object, id) }
+	parts := make([]storage.CompletePart, 0, len(info.Parts))
+	for _, p := range info.Parts {
+		pi, err := set.PutObjectPart(ctx, bucket, object, id, p.Number, io.LimitReader(rc, p.Size), p.Size, storage.PartOptions{})
+		if err != nil {
+			abort()
+			return storage.ObjectInfo{}, err
+		}
+		if pi.ETag != p.ETag {
+			abort()
+			return storage.ObjectInfo{}, fmt.Errorf("part %d: destination ETag %s differs from source %s", p.Number, pi.ETag, p.ETag)
+		}
+		parts = append(parts, storage.CompletePart{Number: p.Number, ETag: pi.ETag})
+	}
+	out, err := set.CompleteMultipartUpload(ctx, bucket, object, id, parts, storage.PutOptions{IfNoneMatch: opts.IfNoneMatch})
+	if err != nil {
+		abort()
+		return storage.ObjectInfo{}, err
+	}
+	return out, nil
 }

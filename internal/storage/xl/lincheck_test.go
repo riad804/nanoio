@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -145,6 +146,141 @@ func TestLinearizabilityChecker(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := linearizable(append([]linOp(nil), tt.ops...)); got != tt.want {
+				t.Errorf("linearizable = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A linearizability checker for one key's version list.
+//
+// State: the versions newest first, as ids, a trailing "!" marking a delete
+// marker. Operations:
+//
+//	put(id)      pushes id
+//	marker(id)   pushes id!
+//	remove(id)   removes id if present (always succeeds)
+//	latest       returns the newest entry: none, an object id or a marker id
+//	version(id)  returns found (object), marker, or absent
+type verOp struct {
+	kind   string // put, marker, remove, latest, version
+	id     string // the version created, removed or asked for
+	result string // latest: "none", "obj:<id>", "dm:<id>"; version: "found", "marker", "absent"
+	call   int64
+	ret    int64
+}
+
+func (o verOp) String() string {
+	return fmt.Sprintf("%s(%s)=%s[%d,%d]", o.kind, o.id, o.result, o.call, o.ret)
+}
+
+func versionsLinearizable(ops []verOp) bool {
+	if len(ops) > 62 {
+		panic("history too long for the bitmask checker")
+	}
+	sort.SliceStable(ops, func(i, j int) bool { return ops[i].call < ops[j].call })
+	n := len(ops)
+	all := uint64(1)<<n - 1
+	type key struct {
+		done  uint64
+		state string
+	}
+	seen := map[key]bool{}
+	var search func(done uint64, state []string) bool
+	search = func(done uint64, state []string) bool {
+		if done == all {
+			return true
+		}
+		k := key{done, strings.Join(state, ",")}
+		if seen[k] {
+			return false
+		}
+		seen[k] = true
+		minRet := int64(inf)
+		for i := 0; i < n; i++ {
+			if done&(1<<i) == 0 && ops[i].ret < minRet {
+				minRet = ops[i].ret
+			}
+		}
+		for i := 0; i < n; i++ {
+			if done&(1<<i) != 0 || ops[i].call > minRet {
+				continue
+			}
+			o := ops[i]
+			next := state
+			switch o.kind {
+			case "put":
+				next = append([]string{o.id}, state...)
+			case "marker":
+				next = append([]string{o.id + "!"}, state...)
+			case "remove":
+				next = nil
+				for _, e := range state {
+					if strings.TrimSuffix(e, "!") != o.id {
+						next = append(next, e)
+					}
+				}
+			case "latest":
+				want := "none"
+				if len(state) > 0 {
+					if top := state[0]; strings.HasSuffix(top, "!") {
+						want = "dm:" + strings.TrimSuffix(top, "!")
+					} else {
+						want = "obj:" + top
+					}
+				}
+				if o.result != want {
+					continue
+				}
+			case "version":
+				want := "absent"
+				for _, e := range state {
+					if strings.TrimSuffix(e, "!") == o.id {
+						want = "found"
+						if strings.HasSuffix(e, "!") {
+							want = "marker"
+						}
+					}
+				}
+				if o.result != want {
+					continue
+				}
+			}
+			if search(done|1<<i, next) {
+				return true
+			}
+		}
+		return false
+	}
+	return search(0, nil)
+}
+
+func TestVersionListCheckerCatchesViolations(t *testing.T) {
+	op := func(kind, id, res string, c, r int64) verOp {
+		return verOp{kind: kind, id: id, result: res, call: c, ret: r}
+	}
+	tests := []struct {
+		name string
+		ops  []verOp
+		want bool
+	}{
+		{"put then latest", []verOp{op("put", "a", "", 0, 1), op("latest", "", "obj:a", 2, 3)}, true},
+		{"newest wins", []verOp{op("put", "a", "", 0, 1), op("put", "b", "", 2, 3), op("latest", "", "obj:b", 4, 5)}, true},
+		{"stale latest after a newer put returned", []verOp{op("put", "a", "", 0, 1), op("put", "b", "", 2, 3), op("latest", "", "obj:a", 4, 5)}, false},
+		{"marker hides", []verOp{op("put", "a", "", 0, 1), op("marker", "m", "", 2, 3), op("latest", "", "dm:m", 4, 5)}, true},
+		{"removing the marker undeletes", []verOp{op("put", "a", "", 0, 1), op("marker", "m", "", 2, 3),
+			op("remove", "m", "", 4, 5), op("latest", "", "obj:a", 6, 7)}, true},
+		{"object visible through a removed marker's absence", []verOp{op("put", "a", "", 0, 1), op("marker", "m", "", 2, 3),
+			op("remove", "m", "", 4, 5), op("latest", "", "dm:m", 6, 7)}, false},
+		{"removed version is absent", []verOp{op("put", "a", "", 0, 1), op("remove", "a", "", 2, 3), op("version", "a", "absent", 4, 5)}, true},
+		{"removed version still found", []verOp{op("put", "a", "", 0, 1), op("remove", "a", "", 2, 3), op("version", "a", "found", 4, 5)}, false},
+		{"concurrent put and latest may miss it", []verOp{op("put", "a", "", 0, 10), op("latest", "", "none", 1, 2)}, true},
+		{"version of a marker", []verOp{op("marker", "m", "", 0, 1), op("version", "m", "marker", 2, 3)}, true},
+		{"read of a version never written", []verOp{op("latest", "", "obj:ghost", 0, 1)}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := versionsLinearizable(append([]verOp(nil), tt.ops...)); got != tt.want {
 				t.Errorf("linearizable = %v, want %v", got, tt.want)
 			}
 		})

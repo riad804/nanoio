@@ -10,15 +10,16 @@ import (
 
 	"nanoio/internal/meta"
 	"nanoio/internal/storage"
+	"nanoio/internal/storage/internal/objlock"
 	"nanoio/internal/storage/xl/disk"
 )
 
 // driveMeta is what one drive says about an object.
 type driveMeta struct {
-	file   *meta.File
-	ver    *meta.Version // latest version, nil when none
-	absent bool          // definitively not present (ENOENT)
-	err    error         // unreadable: offline, corrupt, I/O error
+	file   *meta.File // decoded xl.meta; nil unless the drive answered with one
+	fp     string     // fingerprint of the whole file (see fileFingerprint)
+	absent bool       // definitively not present (ENOENT)
+	err    error      // unreadable: offline, corrupt, I/O error
 	// pending means the drive had not answered when a quorum read returned;
 	// it says nothing about the drive.
 	pending bool
@@ -38,34 +39,67 @@ func (x *XL) readMeta(ctx context.Context, d *drive, bucket, object string) driv
 		x.corrupted.Add(1)
 		return driveMeta{err: fmt.Errorf("%w: drive %d: %s/%s: %v", storage.ErrCorrupted, d.idx, bucket, object, err)}
 	}
-	v := f.Latest()
-	if v == nil || v.Type != meta.TypeObject {
+	if len(f.Versions) == 0 {
 		return driveMeta{absent: true, file: f}
 	}
-	return driveMeta{file: f, ver: v}
+	return driveMeta{file: f, fp: fileFingerprint(f)}
 }
 
-// objState is the quorum view of one object.
+// objState is the quorum view of one object: the version list a read
+// quorum of drives agrees on.
 type objState struct {
 	metas   []driveMeta
-	ver     *meta.Version // a version from the winning group
-	agree   []int         // drives whose metadata matches ver
+	file    *meta.File // the winning group's version list (one drive's copy)
+	agree   []int      // drives whose xl.meta matches it
 	absent  int
 	corrupt int
 	failed  int // offline or unreadable for another reason
-	stale   int // answered with a different version than the winning one
+	stale   int // answered with a different version list than the winning one
 }
 
-// fingerprint identifies a version for agreement: everything that must be
-// identical on every drive of one write. Per-drive fields (shard index,
-// checksums) are excluded.
-func fingerprint(v *meta.Version) string {
-	e := v.Erasure
-	if e == nil {
-		return "no-erasure"
+// latest is the newest version, object or delete marker; nil when the
+// object is not (yet) known.
+func (st *objState) latest() *meta.Version {
+	if st.file == nil {
+		return nil
 	}
-	return fmt.Sprintf("%d|%d|%s|%d|%s|%d|%d|%d|%s", v.Generation, v.ModTime.UnixNano(), v.ETag, v.Size, v.DataDir,
-		e.DataBlocks, e.ParityBlocks, e.BlockSize, v.ContentType)
+	return st.file.Latest()
+}
+
+// generation is the key's compare-and-set generation, 0 when unknown.
+func (st *objState) generation() uint64 {
+	if st.file == nil {
+		return 0
+	}
+	return st.file.Generation()
+}
+
+// fileFingerprint identifies a version list for agreement: everything that
+// must be identical on every drive after one change. Per-drive fields
+// (shard index, checksums) are excluded.
+func fileFingerprint(f *meta.File) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "g%d", f.Generation())
+	for i := range f.Versions {
+		v := &f.Versions[i]
+		fmt.Fprintf(&b, "|%s,%d,%s,%d,%s,%d,%s,%s", v.VersionID, v.Seq, v.Type, v.ModTime.UnixNano(), v.ETag, v.Size,
+			v.DataDir, v.ContentType)
+		if e := v.Erasure; e != nil {
+			fmt.Fprintf(&b, ",%d+%d/%d", e.DataBlocks, e.ParityBlocks, e.BlockSize)
+		}
+	}
+	return b.String()
+}
+
+// versionFingerprint identifies one version, for deciding whether a drive's
+// copy of it is the agreed one.
+func versionFingerprint(v *meta.Version) string {
+	e := ""
+	if v.Erasure != nil {
+		e = fmt.Sprintf("%d+%d/%d", v.Erasure.DataBlocks, v.Erasure.ParityBlocks, v.Erasure.BlockSize)
+	}
+	return fmt.Sprintf("%s,%d,%s,%d,%s,%d,%s,%s,%s", v.VersionID, v.Seq, v.Type, v.ModTime.UnixNano(), v.ETag, v.Size,
+		v.DataDir, v.ContentType, e)
 }
 
 // stateOf returns the quorum view of bucket/object. When K > M a version
@@ -92,21 +126,38 @@ func (x *XL) stateOf(ctx context.Context, bucket, object string) *objState {
 	}
 	counts := map[string]int{}
 	absent := 0
+	var graceC <-chan time.Time
+loop:
 	for got := 0; got < n; got++ {
-		a := <-ch
-		st.metas[a.i] = a.m
-		done := false
-		switch {
-		case a.m.ver != nil:
-			fp := fingerprint(a.m.ver)
-			counts[fp]++
-			done = counts[fp] >= x.k
-		case a.m.absent:
-			absent++
-			done = absent > n-x.k
-		}
-		if done {
-			break
+		select {
+		case a := <-ch:
+			st.metas[a.i] = a.m
+			switch {
+			case a.m.file != nil && !a.m.absent:
+				fp := a.m.fp
+				counts[fp]++
+				if counts[fp] >= x.k && graceC == nil {
+					// Quorum agrees. The drives that have not answered
+					// get StragglerGrace: normally they answer within it,
+					// and every agreeing drive is spare redundancy for
+					// the read (a damaged shard among the first K must
+					// have parity to fall back on). A hung drive costs
+					// the grace, not its timeout.
+					if x.stragglerGrace <= 0 {
+						break loop
+					}
+					t := time.NewTimer(x.stragglerGrace)
+					defer t.Stop()
+					graceC = t.C
+				}
+			case a.m.absent:
+				absent++
+				if absent > n-x.k {
+					break loop // definitively not there
+				}
+			}
+		case <-graceC:
+			break loop
 		}
 	}
 	st.group()
@@ -131,9 +182,8 @@ func (st *objState) group() {
 	for i, m := range st.metas {
 		switch {
 		case m.pending:
-		case m.ver != nil:
-			fp := fingerprint(m.ver)
-			groups[fp] = append(groups[fp], i)
+		case m.file != nil && !m.absent:
+			groups[m.fp] = append(groups[m.fp], i)
 		case m.absent:
 			st.absent++
 		case errors.Is(m.err, storage.ErrCorrupted):
@@ -146,8 +196,10 @@ func (st *objState) group() {
 	for fp, idxs := range groups {
 		better := bestFP == "" || len(idxs) > len(groups[bestFP])
 		if !better && len(idxs) == len(groups[bestFP]) {
-			// Tie: prefer the newer write.
-			better = st.metas[idxs[0]].ver.ModTime.After(st.metas[groups[bestFP][0]].ver.ModTime)
+			// Tie: prefer the newer generation, then the newer write.
+			a, b := st.metas[idxs[0]].file, st.metas[groups[bestFP][0]].file
+			better = a.Generation() > b.Generation() ||
+				a.Generation() == b.Generation() && a.Latest().ModTime.After(b.Latest().ModTime)
 		}
 		if better {
 			bestFP = fp
@@ -161,7 +213,7 @@ func (st *objState) group() {
 	if bestFP != "" {
 		st.agree = groups[bestFP]
 		sort.Ints(st.agree)
-		st.ver = st.metas[st.agree[0]].ver
+		st.file = st.metas[st.agree[0]].file
 	}
 }
 
@@ -196,14 +248,29 @@ func (x *XL) versionFor(tmpl meta.Version, dist []int, drive int, sums []meta.Ch
 	return v
 }
 
-// commitSpec describes publishing one staged object on every drive.
+// commitSpec describes one change to a key's version list on every drive:
+// publishing a staged object (op OpPut), adding a delete marker (OpMarker)
+// or removing a version (OpRemove).
 type commitSpec struct {
 	bucket, object string
+	op             disk.CommitOp
 	stageID        string
 	dataDir        string
-	tmpl           meta.Version // version without Erasure; ModTime set
-	dist           []int
-	blockSize      int64
+	// tmpl is the version without Erasure: VersionID, Seq, ModTime set.
+	// For OpMarker it is the whole delete marker.
+	tmpl meta.Version
+	// removeID is the stored version ID OpRemove removes and OpSetLock
+	// changes.
+	removeID string
+	// lock is the new lock state of OpSetLock.
+	lock *meta.Lock
+	// metaUpd is the change of OpSetMeta.
+	metaUpd *meta.MetaUpdate
+	// guard is how object lock is judged on every drive; guard.Now is set
+	// once by the coordinator so all drives decide alike.
+	guard     meta.Guard
+	dist      []int
+	blockSize int64
 	// sums[d] are drive d's part checksums. participants[d] says whether a
 	// staged data dir exists on drive d.
 	sums         [][]meta.Checksum
@@ -215,16 +282,10 @@ type commitSpec struct {
 	// need is how many committed drives commit waits for before returning
 	// (0 means every participating drive).
 	need int
-}
-
-// nextGeneration is the generation a write based on st should carry, and
-// the generation the drives must not exceed for it to commit. An object
-// that is not (yet) present at quorum starts at 1.
-func nextGeneration(st *objState, readQuorum int) (next, prev uint64) {
-	if st.found(readQuorum) {
-		prev = st.ver.Generation
-	}
-	return prev + 1, prev
+	// files and dataDirs are, per drive, the whole xl.meta and the staged
+	// data directories of an OpReplace (repair), which is built per drive.
+	files    []*meta.File
+	dataDirs [][]string
 }
 
 // commitResult is the outcome on the drives that took part.
@@ -234,9 +295,9 @@ type commitResult struct {
 	commits   []disk.Commit
 }
 
-// errStraggler marks a drive whose commit had not answered when the write
-// quorum was reached.
-var errStraggler = errors.New("commit still in flight when the write quorum was reached")
+// errStraggler marks a drive that had not answered when its caller had
+// what it needed.
+var errStraggler = errors.New("still in flight when the quorum was reached")
 
 // commit publishes the staged object on the participating drives; each
 // drive's CommitObject is atomic on that drive. It returns when spec.need
@@ -244,86 +305,61 @@ var errStraggler = errors.New("commit still in flight when the write quorum was 
 // drives when need is 0, as for repairs). Commits still in flight then are
 // finished in the background if they succeed, and a delayed commit that
 // lands after a newer write is refused by that drive's generation check.
-// The caller decides, by quorum, whether to Finish or Rollback.
+// On failure it waits for every commit, since each one that landed must be
+// rolled back. The caller decides, by quorum, whether to Finish or Rollback.
 func (x *XL) commit(ctx context.Context, spec commitSpec) commitResult {
 	n := len(x.drives)
-	res := commitResult{errs: make([]error, n), commits: make([]disk.Commit, n)}
-	// The calls run detached from the request: a drive that has begun a
-	// commit finishes it, and the bookkeeping below settles it either way.
-	cctx, cancel := detached(ctx)
-	type outcome struct {
-		i   int
-		c   disk.Commit
-		err error
-	}
-	ch := make(chan outcome, n)
-	launched := 0
-	for i, d := range x.drives {
-		if !spec.participants[i] {
-			res.errs[i] = errDriveOffline
-			continue
-		}
-		launched++
-		go func() {
-			c, err := d.CommitObject(cctx, disk.CommitRequest{
-				Bucket: spec.bucket, Object: spec.object, StageID: spec.stageID, DataDir: spec.dataDir,
-				Version:  x.versionFor(spec.tmpl, spec.dist, i, spec.sums[i], spec.blockSize),
-				CheckGen: spec.checkGen, PrevGen: spec.prevGen,
-			})
-			ch <- outcome{i, c, err}
-		}()
-	}
 	need := spec.need
-	if need <= 0 || need > launched {
-		need = launched
+	if need <= 0 {
+		need = countTrue(spec.participants)
 	}
-	seen := make([]bool, n)
-	got, ok := 0, 0
-	var grace <-chan time.Time
-	for got < launched {
-		select {
-		case o := <-ch:
-			got++
-			seen[o.i] = true
-			res.commits[o.i], res.errs[o.i] = o.c, o.err
-			if o.err == nil {
-				ok++
-				res.committed = append(res.committed, o.i)
-			}
-			if ok >= need && grace == nil && got < launched {
-				t := time.NewTimer(x.stragglerGrace)
-				defer t.Stop()
-				grace = t.C
-			}
-			continue
-		case <-grace:
-		}
-		break
-	}
-	sort.Ints(res.committed)
-	if got == launched {
-		cancel()
-		return res
-	}
-	for i := range res.errs {
-		if spec.participants[i] && !seen[i] {
-			res.errs[i] = errStraggler
-		}
-	}
-	remaining := launched - got
-	go func() {
+	grace := x.stragglerGrace
+	late := func(i int, c disk.Commit) {
+		fctx, cancel := detached(ctx)
 		defer cancel()
-		fctx, fcancel := detached(ctx)
-		defer fcancel()
-		for k := 0; k < remaining; k++ {
-			if o := <-ch; o.err == nil {
-				if err := o.c.Finish(fctx); err != nil {
-					x.log.Warn("xl: could not finish a late commit", "bucket", spec.bucket, "object", spec.object, "drive", o.i, "err", err)
-				}
-			}
+		if err := c.Finish(fctx); err != nil {
+			x.log.Warn("xl: could not finish a late commit", "bucket", spec.bucket, "object", spec.object, "drive", i, "err", err)
 		}
-	}()
+	}
+	// Non-participants are not asked; scatter would otherwise try them.
+	commits, errs := scatterSubset(ctx, x, spec.participants, need, grace,
+		func(ctx context.Context, d *drive) (disk.Commit, error) {
+			req := disk.CommitRequest{
+				Bucket: spec.bucket, Object: spec.object, Op: spec.op, StageID: spec.stageID, DataDir: spec.dataDir,
+				VersionID: spec.removeID, Seq: spec.tmpl.Seq, CheckGen: spec.checkGen, PrevGen: spec.prevGen,
+				Lock: spec.lock, Meta: spec.metaUpd, Guard: spec.guard,
+			}
+			switch spec.op {
+			case disk.OpPut:
+				req.Version = x.versionFor(spec.tmpl, spec.dist, d.idx, spec.sums[d.idx], spec.blockSize)
+			case disk.OpMarker:
+				req.Version = spec.tmpl
+			case disk.OpReplace:
+				req.File, req.DataDirs = spec.files[d.idx], spec.dataDirs[d.idx]
+			}
+			return d.CommitObject(ctx, req)
+		}, late)
+	res := commitResult{errs: errs, commits: commits}
+	for i := 0; i < n; i++ {
+		if errs[i] == nil {
+			res.committed = append(res.committed, i)
+		}
+	}
 	return res
+}
+
+// scatterSubset is scatter over the drives with include set. Drives left
+// out report errDriveOffline. When the quorum fails it waits for every
+// answer (giveUp is off) because the caller must undo the ones that landed.
+func scatterSubset[T any](ctx context.Context, x *XL, include []bool, need int, grace time.Duration,
+	fn func(ctx context.Context, d *drive) (T, error), late func(i int, v T)) ([]T, []error) {
+	return scatter(ctx, x, need, grace, false, true, func(ctx context.Context, d *drive) (T, error) {
+		var zero T
+		if !include[d.idx] {
+			return zero, errDriveOffline
+		}
+		return fn(ctx, d)
+	}, late)
 }
 
 // detached returns a context that outlives ctx's cancellation but not a
@@ -346,7 +382,8 @@ func (x *XL) finish(ctx context.Context, spec commitSpec, res commitResult) {
 }
 
 // finishCommit applies quorum to a commit: on success it makes the commits
-// final and removes staging; on failure it rolls every drive back. The
+// final; on failure it rolls every drive back. The staging areas are the
+// caller's to remove (each caller defers removeStages). The
 // follow-up runs detached from ctx: a client that gave up must not leave a
 // half-committed object behind.
 func (x *XL) finishCommit(ctx context.Context, spec commitSpec, res commitResult) error {
@@ -359,11 +396,9 @@ func (x *XL) finishCommit(ctx context.Context, spec commitSpec, res commitResult
 				x.log.Warn("xl: could not roll back commit", "bucket", spec.bucket, "object", spec.object, "drive", i, "err", err)
 			}
 		}
-		x.removeStages(ctx, spec.stageID)
 		return quorumError(spec.bucket, spec.object, len(res.committed), need, res.errs)
 	}
 	x.finish(ctx, spec, res)
-	x.removeStages(ctx, spec.stageID)
 	// Drives that missed the commit are stale; have the scanner repair them.
 	if len(res.committed) < len(x.drives) {
 		x.queueHeal(spec.bucket, spec.object)
@@ -371,27 +406,33 @@ func (x *XL) finishCommit(ctx context.Context, spec commitSpec, res commitResult
 	return nil
 }
 
-// objectInfo converts a version to the API-facing description.
-func toInfo(bucket, object string, v *meta.Version) storage.ObjectInfo {
+// toInfo converts a version to the API-facing description. state is the
+// bucket's versioning state, which decides how the version ID is reported.
+func toInfo(bucket, object string, v *meta.Version, latest bool, state storage.VersioningState) storage.ObjectInfo {
 	info := storage.ObjectInfo{
-		Bucket: bucket, Name: object, VersionID: v.VersionID, IsLatest: true,
-		Size: v.Size, ModTime: v.ModTime, ETag: v.ETag, ContentType: v.ContentType,
+		Bucket: bucket, Name: object, VersionID: storage.ReportedVersionID(state, v.VersionID), IsLatest: latest,
+		DeleteMarker: v.Type == meta.TypeDeleteMarker,
+		Size:         v.Size, ModTime: v.ModTime, ETag: v.ETag, ContentType: v.ContentType,
 		UserDefined: copyMap(v.UserMeta),
 	}
 	for _, p := range v.Parts {
 		info.Parts = append(info.Parts, storage.PartInfo{Number: p.N, ETag: p.ETag, Size: p.Size})
 	}
+	info.Retention, info.LegalHold = objlock.Info(v.Lock)
 	return info
 }
 
 func trimETag(s string) string { return strings.Trim(s, `"`) }
 
 // checkPreconditions evaluates If-Match / If-None-Match for a write
-// against the current state.
+// against the current state. A latest delete marker counts as "the object
+// does not exist".
 func checkPreconditions(st *objState, readQuorum int, opts storage.PutOptions, bucket, object string) error {
 	var cur *meta.Version
 	if st.found(readQuorum) {
-		cur = st.ver
+		if l := st.latest(); l != nil && l.Type == meta.TypeObject {
+			cur = l
+		}
 	}
 	if opts.IfNoneMatch == "*" && cur != nil {
 		return storage.Wrap(storage.ErrPreconditionFailed, bucket, object)

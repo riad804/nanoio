@@ -6,6 +6,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 )
@@ -30,6 +31,20 @@ type StorageAPI interface {
 	BucketExists(ctx context.Context, bucket string) (bool, error)
 	ListBuckets(ctx context.Context) ([]BucketInfo, error)
 	DeleteBucket(ctx context.Context, bucket string, opts DeleteBucketOptions) error
+	// GetBucketVersioning reports the bucket's versioning state.
+	GetBucketVersioning(ctx context.Context, bucket string) (VersioningConfig, error)
+	// SetBucketVersioning moves the bucket to state. The state machine is
+	// Unversioned -> Enabled <-> Suspended; Enabled and Suspended never go
+	// back to Unversioned, and a transition not in it returns
+	// ErrIllegalVersioning. Setting the current state is a no-op.
+	SetBucketVersioning(ctx context.Context, bucket string, state VersioningState) error
+	// GetBucketObjectLock reports the bucket's object lock configuration.
+	// A bucket created without object lock returns Enabled == false.
+	GetBucketObjectLock(ctx context.Context, bucket string) (ObjectLockConfig, error)
+	// SetBucketObjectLock replaces the default retention of a bucket that
+	// was created with object lock. A bucket without it, or a configuration
+	// that would turn it off, returns ErrInvalidBucketState.
+	SetBucketObjectLock(ctx context.Context, bucket string, cfg ObjectLockConfig) error
 
 	// Objects.
 	PutObject(ctx context.Context, bucket, object string, r io.Reader, size int64, opts PutOptions) (ObjectInfo, error)
@@ -40,6 +55,13 @@ type StorageAPI interface {
 	UpdateObjectMetadata(ctx context.Context, bucket, object string, opts UpdateMetaOptions) (ObjectInfo, error)
 	ListObjects(ctx context.Context, bucket string, opts ListOptions) (ListResult, error)
 	ListObjectVersions(ctx context.Context, bucket string, opts ListOptions) (ListVersionsResult, error)
+	// SetObjectRetention sets, extends, shortens or removes (zero r) the
+	// retention of one object version, subject to the rules on Retention.
+	// A refusal is ErrObjectLocked and changes nothing.
+	SetObjectRetention(ctx context.Context, ref ObjectRef, r Retention, opts RetentionOptions) (ObjectInfo, error)
+	// SetObjectLegalHold turns the legal hold of one object version on or
+	// off.
+	SetObjectLegalHold(ctx context.Context, ref ObjectRef, on bool) (ObjectInfo, error)
 
 	// Multipart.
 	NewMultipartUpload(ctx context.Context, bucket, object string, opts PutOptions) (uploadID string, err error)
@@ -74,13 +96,149 @@ type ObjectRef struct {
 	VersionID string
 }
 
-// MakeBucketOptions is reserved for future per-bucket creation settings.
-type MakeBucketOptions struct{}
+// MakeBucketOptions holds per-bucket creation settings.
+type MakeBucketOptions struct {
+	// ObjectLock creates the bucket with S3 Object Lock, which also
+	// enables versioning and can never be turned off.
+	ObjectLock bool
+}
 
 // DeleteBucketOptions controls DeleteBucket.
 type DeleteBucketOptions struct {
 	// Force removes the bucket even if it contains objects.
 	Force bool
+}
+
+// VersioningState is a bucket's versioning state.
+type VersioningState string
+
+const (
+	// VersioningUnversioned is the state of a bucket that has never had
+	// versioning enabled. S3 reports it as an empty configuration.
+	VersioningUnversioned VersioningState = ""
+	VersioningEnabled     VersioningState = "Enabled"
+	VersioningSuspended   VersioningState = "Suspended"
+)
+
+// Valid reports whether s is one of the three states.
+func (s VersioningState) Valid() bool {
+	return s == VersioningUnversioned || s == VersioningEnabled || s == VersioningSuspended
+}
+
+// VersioningConfig is the state plus the sequence number of the change that
+// produced it (0 for a bucket that never had one). The sequence orders
+// changes across drives and sets.
+type VersioningConfig struct {
+	State VersioningState
+	Seq   uint64
+}
+
+// RetentionMode is an S3 Object Lock retention mode.
+type RetentionMode string
+
+const (
+	// RetentionGovernance retention can be shortened or removed only by a
+	// caller who asked to bypass it (DeleteOptions.BypassGovernance,
+	// RetentionOptions.BypassGovernance) and was authorised to.
+	RetentionGovernance RetentionMode = "GOVERNANCE"
+	// RetentionCompliance retention can be extended and nothing else, by
+	// anyone, until it expires.
+	RetentionCompliance RetentionMode = "COMPLIANCE"
+)
+
+// Valid reports whether m is a retention mode.
+func (m RetentionMode) Valid() bool {
+	return m == RetentionGovernance || m == RetentionCompliance
+}
+
+// Retention is a retention mode and the instant it ends. The zero value
+// means no retention. Retention that has ended protects nothing.
+type Retention struct {
+	Mode  RetentionMode
+	Until time.Time
+}
+
+// IsZero reports whether r is no retention.
+func (r Retention) IsZero() bool { return r.Mode == "" && r.Until.IsZero() }
+
+// Validate checks r against now: a mode and a date together, the mode known,
+// and the date strictly in the future. It is deliberately strict about the
+// future for both modes, so a clock-skewed client cannot create retention
+// that is already over.
+func (r Retention) Validate(now time.Time) error {
+	switch {
+	case r.IsZero():
+		return nil
+	case !r.Mode.Valid():
+		return fmt.Errorf("%w: unknown retention mode %q", ErrInvalidRetention, r.Mode)
+	case r.Until.IsZero():
+		return fmt.Errorf("%w: retention mode without a retain-until date", ErrInvalidRetention)
+	case !r.Until.After(now):
+		return fmt.Errorf("%w: the retain-until date must be in the future", ErrInvalidRetention)
+	}
+	return nil
+}
+
+// RetentionOptions controls SetObjectRetention.
+type RetentionOptions struct {
+	// BypassGovernance lets the change shorten or remove GOVERNANCE
+	// retention. The API layer sets it only for a principal holding
+	// s3:BypassGovernanceRetention that sent
+	// x-amz-bypass-governance-retention: true. It never affects COMPLIANCE
+	// retention or a legal hold.
+	BypassGovernance bool
+}
+
+// DefaultRetention is the retention a bucket applies to new versions that
+// bring none of their own. Exactly one of Days and Years is positive.
+type DefaultRetention struct {
+	Mode  RetentionMode
+	Days  int
+	Years int
+}
+
+// Validate checks the shape S3 allows.
+func (d DefaultRetention) Validate() error {
+	switch {
+	case !d.Mode.Valid():
+		return fmt.Errorf("%w: unknown retention mode %q", ErrInvalidRetention, d.Mode)
+	case d.Days < 0 || d.Years < 0 || (d.Days > 0) == (d.Years > 0):
+		return fmt.Errorf("%w: a default retention needs exactly one of Days and Years, positive", ErrInvalidRetention)
+	}
+	return nil
+}
+
+// Until returns the end date of a retention that starts at t.
+func (d DefaultRetention) Until(t time.Time) time.Time {
+	if d.Years > 0 {
+		return t.AddDate(d.Years, 0, 0)
+	}
+	return t.AddDate(0, 0, d.Days)
+}
+
+// ObjectLockConfig is a bucket's object lock configuration.
+type ObjectLockConfig struct {
+	// Enabled is true for a bucket created with object lock. It is
+	// irreversible.
+	Enabled bool
+	// Default applies to new versions that carry no retention; nil for none.
+	Default *DefaultRetention
+	// Seq counts changes to the configuration. It is reported by
+	// GetBucketObjectLock, which lets a cluster tell which of two diverged
+	// copies is newer, and ignored by SetBucketObjectLock.
+	Seq uint64
+}
+
+// CheckVersioningTransition validates a move between states. A bucket that
+// has ever been versioned can never return to Unversioned.
+func CheckVersioningTransition(from, to VersioningState) error {
+	switch {
+	case !to.Valid() || !from.Valid():
+		return fmt.Errorf("%w: unknown state %q", ErrIllegalVersioning, to)
+	case to == VersioningUnversioned && from != VersioningUnversioned:
+		return fmt.Errorf("%w: a versioned bucket cannot become unversioned", ErrIllegalVersioning)
+	}
+	return nil
 }
 
 // BucketInfo describes a bucket.
@@ -103,23 +261,77 @@ type PutOptions struct {
 	UserDefined   map[string]string
 	ContentMD5    string // hex or empty; verified while streaming
 	ContentSHA256 string // hex or empty; verified while streaming
-	// Versioned is decided by the caller from bucket config.
-	Versioned   bool
+	// Whether the write creates a new version or replaces the null version
+	// is decided by the backend from the bucket's versioning state, under
+	// the bucket lock.
 	IfMatch     string // commit only if the current ETag matches
 	IfNoneMatch string // "*" commits only if the key does not exist
+	// Retention and LegalHold lock the new version. Either on a bucket
+	// without object lock is ErrObjectLockNotEnabled. A zero Retention gets
+	// the bucket's default retention, if it has one; an explicit one
+	// replaces it.
+	Retention Retention
+	LegalHold bool
+	// Finalize, if set, is called by PutObject once the whole body has been
+	// read and verified and before the version is committed. The keys it
+	// returns are added to UserDefined. It is how a caller records a digest
+	// of data the backend never sees (the plaintext MD5 of an encrypted
+	// body). It is not used by multipart uploads.
+	Finalize func() map[string]string
 }
+
+// FinalUserDefined returns a copy of o.UserDefined with the keys of
+// o.Finalize (if set) added. A backend calls it once, after the body has been
+// read and verified.
+func (o PutOptions) FinalUserDefined() map[string]string {
+	var extra map[string]string
+	if o.Finalize != nil {
+		extra = o.Finalize()
+	}
+	if len(o.UserDefined) == 0 && len(extra) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(o.UserDefined)+len(extra))
+	for k, v := range o.UserDefined {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+// NullVersionID is how the null version appears at the StorageAPI boundary
+// and on the wire. Backends store it as the empty version ID, and report it
+// only for buckets that are (or have been) versioned: a bucket that never
+// had versioning reports no version ID at all.
+const NullVersionID = "null"
 
 // GetOptions controls GetObject and StatObject.
 type GetOptions struct {
+	// VersionID selects a version: "" the latest, NullVersionID the null
+	// version, otherwise a version UUID.
 	VersionID string
 	Range     *ByteRange
 }
 
 // DeleteOptions controls DeleteObject.
+//
+// Without VersionID the backend decides from the bucket's versioning state:
+// Enabled adds a delete marker with a new version ID, Suspended replaces
+// the null version with a null delete marker, Unversioned removes the
+// object. With VersionID that one version (object or delete marker) is
+// removed permanently.
+//
+// Removing a version that object lock protects (a legal hold, or retention
+// that has not ended and that the caller may not bypass) fails with
+// ErrObjectLocked. Adding a delete marker is never refused: it removes
+// nothing.
 type DeleteOptions struct {
 	VersionID string
-	// Versioned without VersionID writes a delete marker.
-	Versioned bool
+	// BypassGovernance allows removing a version under GOVERNANCE retention.
+	// See RetentionOptions.BypassGovernance.
+	BypassGovernance bool
 }
 
 // DeleteResult reports what DeleteObject did.
@@ -135,10 +347,25 @@ type CopyOptions struct {
 	Put             PutOptions
 }
 
-// UpdateMetaOptions replaces the user metadata of one version.
+// UpdateMetaOptions changes the metadata of one version in place. Its data,
+// ETag, size and parts are never touched, and no data is read or written.
 type UpdateMetaOptions struct {
-	VersionID   string
+	// VersionID selects the version: "" the latest, NullVersionID the
+	// null version.
+	VersionID string
+	// UserDefined, when non-nil, replaces the version's whole user-defined
+	// map (an empty non-nil map clears it). Nil leaves it unchanged.
 	UserDefined map[string]string
+	// ContentType, when non-empty, replaces the content type.
+	ContentType string
+	// Touch sets the modification time to now (S3 does this on a copy);
+	// otherwise it is left alone (an internal re-wrap).
+	Touch bool
+	// IfETag, when non-empty, makes the update conditional on the version's
+	// current ETag: a version rewritten meanwhile is ErrPreconditionFailed
+	// rather than being overwritten with metadata computed for its
+	// predecessor.
+	IfETag string
 }
 
 // ObjectInfo is the API-facing view of one object version. It is built from
@@ -155,6 +382,9 @@ type ObjectInfo struct {
 	ContentType  string
 	UserDefined  map[string]string
 	Parts        []PartInfo
+	// Retention and LegalHold are the version's object lock state.
+	Retention Retention
+	LegalHold bool
 }
 
 // ListOptions controls ListObjects and ListObjectVersions. Results are in
@@ -222,6 +452,9 @@ type ListPartsOptions struct {
 
 // ListPartsResult is the result of ListObjectParts.
 type ListPartsResult struct {
+	// UserDefined is the metadata the upload was created with; the API
+	// layer reads the encryption description of an upload from it.
+	UserDefined          map[string]string
 	Parts                []PartInfo
 	IsTruncated          bool
 	NextPartNumberMarker int

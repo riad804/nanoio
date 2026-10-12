@@ -48,11 +48,11 @@ type objectReader struct {
 	closed  bool
 }
 
-// newObjectReader builds a reader over the agreeing drives of st. It pins
-// their data directories so a concurrent overwrite defers their removal
+// newObjectReader builds a reader over version v of the object, using the
+// drives of st that agree on the version list. It pins their copies of v's
+// data directory so a concurrent overwrite or delete defers their removal
 // until the reader is closed.
-func (x *XL) newObjectReader(ctx context.Context, bucket, object string, st *objState) (*objectReader, error) {
-	v := st.ver
+func (x *XL) newObjectReader(ctx context.Context, bucket, object string, st *objState, v *meta.Version) (*objectReader, error) {
 	e := v.Erasure
 	if e == nil || e.DataBlocks != x.k || e.ParityBlocks != x.m || e.BlockSize <= 0 {
 		return nil, storage.Wrap(fmt.Errorf("%w: object was written with a different erasure layout", storage.ErrCorrupted), bucket, object)
@@ -77,7 +77,12 @@ func (x *XL) newObjectReader(ctx context.Context, bucket, object string, st *obj
 	var releases []func()
 	for _, i := range st.agree {
 		d := x.drives[i]
-		idx := st.metas[i].ver.Erasure.Index
+		// Each drive's own record of this version says which shard it holds.
+		mine := st.metas[i].file.Find(v.VersionID)
+		if mine == nil || mine.Erasure == nil {
+			continue
+		}
+		idx := mine.Erasure.Index
 		if idx < 0 || idx >= len(r.byShard) || r.byShard[idx] != nil {
 			continue // inconsistent shard index: do not trust this drive
 		}

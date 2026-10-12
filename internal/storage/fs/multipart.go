@@ -21,6 +21,7 @@ import (
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/internal/fsutil"
 	"nanoio/internal/storage/internal/listing"
+	"nanoio/internal/storage/internal/objlock"
 )
 
 // Multipart upload state lives under
@@ -54,6 +55,8 @@ type uploadDoc struct {
 	Initiated   time.Time         `json:"initiated"`
 	ContentType string            `json:"contentType,omitempty"`
 	UserDefined map[string]string `json:"userDefined,omitempty"`
+	// Lock is the object lock requested when the upload was started.
+	Lock objlock.Requested `json:"lock,omitzero"`
 }
 
 type partDoc struct {
@@ -157,9 +160,6 @@ func (f *FS) NewMultipartUpload(ctx context.Context, bucket, object string, opts
 	if err := validate(bucket, object); err != nil {
 		return "", err
 	}
-	if opts.Versioned {
-		return "", notImpl("versioned NewMultipartUpload")
-	}
 	if err := f.enter(); err != nil {
 		return "", err
 	}
@@ -181,8 +181,16 @@ func (f *FS) NewMultipartUpload(ctx context.Context, bucket, object string, opts
 	if ct == "" {
 		ct = defaultContentType
 	}
+	lockCfg, err := f.objectLockOf(bucket)
+	if err != nil {
+		return "", err
+	}
+	req, err := objlock.Request(lockCfg.cfg, opts, time.Now())
+	if err != nil {
+		return "", storage.Wrap(err, bucket, object)
+	}
 	doc, err := json.Marshal(uploadDoc{Bucket: bucket, Object: object, Initiated: time.Now().UTC(),
-		ContentType: ct, UserDefined: copyMap(opts.UserDefined)})
+		ContentType: ct, UserDefined: copyMap(opts.UserDefined), Lock: req})
 	if err != nil {
 		return "", err
 	}
@@ -350,7 +358,7 @@ func (f *FS) ListObjectParts(ctx context.Context, bucket, object, uploadID strin
 		return zero, err
 	}
 	defer unlock()
-	_, dir, err := f.readUpload(bucket, object, uploadID)
+	udoc, dir, err := f.readUpload(bucket, object, uploadID)
 	if err != nil {
 		return zero, err
 	}
@@ -369,7 +377,7 @@ func (f *FS) ListObjectParts(ctx context.Context, bucket, object, uploadID strin
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	var res storage.ListPartsResult
+	res := storage.ListPartsResult{UserDefined: copyMap(udoc.UserDefined)}
 	for i, n := range numbers {
 		if i == limit {
 			res.IsTruncated = true
@@ -492,9 +500,6 @@ func (f *FS) CompleteMultipartUpload(ctx context.Context, bucket, object, upload
 	if err := checkUploadID(bucket, object, uploadID); err != nil {
 		return zero, err
 	}
-	if opts.Versioned {
-		return zero, notImpl("versioned CompleteMultipartUpload")
-	}
 	if len(parts) == 0 || len(parts) > MaxParts {
 		return zero, storage.Wrap(fmt.Errorf("%w: %d parts listed", storage.ErrInvalidPart, len(parts)), bucket, object)
 	}
@@ -600,7 +605,7 @@ func (f *FS) CompleteMultipartUpload(ctx context.Context, bucket, object, upload
 	info, err := f.commit(bucket, object, stage, stagedData, meta.Version{
 		Type: meta.TypeObject, Size: total, ETag: etag, DataDir: dataDir,
 		ContentType: doc.ContentType, UserMeta: copyMap(doc.UserDefined), Parts: versionParts,
-	}, opts, fs.hit)
+	}, objlock.Carry(opts, doc.Lock, time.Now()), fs.hit)
 	if err != nil {
 		return zero, err
 	}

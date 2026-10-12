@@ -167,7 +167,7 @@ func TestDecodeRejectsDamage(t *testing.T) {
 			return b
 		}), ErrCorrupt},
 		{"future format, valid crc", mutate(func(b []byte) []byte {
-			p := bytes.Replace(b[headerSize:], []byte(`"format":1`), []byte(`"format":2`), 1)
+			p := bytes.Replace(b[headerSize:], []byte(`"format":2`), []byte(`"format":4`), 1)
 			b = append(b[:headerSize], p...)
 			resum(b)
 			return b
@@ -284,7 +284,7 @@ func TestNewVersionID(t *testing.T) {
 // TestGolden pins the byte-exact encoding. Run with -update to regenerate,
 // and only when the format version is deliberately changed.
 func TestGolden(t *testing.T) {
-	path := filepath.Join("testdata", "v1.meta")
+	path := filepath.Join("testdata", "v2.meta")
 	got, err := Encode(sampleFile())
 	if err != nil {
 		t.Fatal(err)
@@ -306,6 +306,26 @@ func TestGolden(t *testing.T) {
 	}
 	if _, err := Decode(want); err != nil {
 		t.Errorf("golden file no longer decodes: %v", err)
+	}
+}
+
+// TestLegacyGoldenDecodes: files written before versioning (format 1, here
+// even with several versions and a marker) must keep decoding, and must
+// re-encode as the format they are (1 if they use no versioning feature).
+func TestLegacyGoldenDecodes(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "v1.meta"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := Decode(data)
+	if err != nil {
+		t.Fatalf("a format-1 file no longer decodes: %v", err)
+	}
+	if f.Format != FormatVersion || len(f.Versions) != 3 || f.Gen != 0 {
+		t.Errorf("decoded = format %d, %d versions, gen %d", f.Format, len(f.Versions), f.Gen)
+	}
+	if f.Generation() != 0 {
+		t.Errorf("Generation = %d", f.Generation())
 	}
 }
 

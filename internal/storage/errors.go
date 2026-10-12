@@ -1,6 +1,9 @@
 package storage
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // Sentinel errors. The mapping to S3 codes and HTTP statuses lives in api/ so
 // this package stays HTTP-free; api/ has a test that fails if any sentinel
@@ -30,7 +33,51 @@ var (
 	ErrDiskFull           = errors.New("disk full")
 	ErrCorrupted          = errors.New("stored data failed verification")
 	ErrNotImplemented     = errors.New("not implemented")
+	// ErrIllegalVersioning is a versioning configuration the state machine
+	// does not allow.
+	ErrIllegalVersioning = errors.New("illegal versioning configuration")
+	// ErrObjectLocked means object lock refuses the change: a legal hold,
+	// or retention that has not ended and that the caller may not bypass.
+	ErrObjectLocked = errors.New("object is protected by object lock")
+	// ErrObjectLockNotEnabled means the bucket was not created with object
+	// lock, so there is nothing to configure or apply.
+	ErrObjectLockNotEnabled = errors.New("bucket does not have object lock enabled")
+	// ErrInvalidRetention is a retention that is malformed or already over.
+	ErrInvalidRetention = errors.New("invalid retention")
+	// ErrInvalidBucketState means the bucket's state does not allow the
+	// request, such as suspending versioning on a bucket with object lock.
+	ErrInvalidBucketState = errors.New("invalid bucket state")
+	// ErrInvalidVersionID is a version ID that is neither "null" nor a UUID.
+	ErrInvalidVersionID = errors.New("invalid version id")
 )
+
+// DeleteMarkerError reports that the version a read resolved to is a delete
+// marker. Without an explicit version ID the object is "not found" (and
+// matches ErrObjectNotFound, as in S3, which answers 404); asking for the
+// marker's own version ID is "method not allowed" (ErrIsDeleteMarker, 405).
+// Either way the marker's identity travels with it for the response headers.
+type DeleteMarkerError struct {
+	Bucket, Object string
+	VersionID      string // as reported: "null" or a UUID
+	ModTime        time.Time
+	// Explicit is true when the caller named the marker's version ID.
+	Explicit bool
+}
+
+func (e *DeleteMarkerError) Error() string {
+	if e.Explicit {
+		return ErrIsDeleteMarker.Error() + ": " + e.Bucket + "/" + e.Object
+	}
+	return ErrObjectNotFound.Error() + " (latest version is a delete marker): " + e.Bucket + "/" + e.Object
+}
+
+// Is makes the error match the sentinel that fits the request.
+func (e *DeleteMarkerError) Is(target error) bool {
+	if e.Explicit {
+		return target == ErrIsDeleteMarker
+	}
+	return target == ErrObjectNotFound
+}
 
 // AllErrors returns every sentinel, for exhaustiveness checks.
 func AllErrors() []error {
@@ -42,7 +89,8 @@ func AllErrors() []error {
 		ErrEntityTooLarge, ErrInvalidRange, ErrPreconditionFailed,
 		ErrNoSuchUpload, ErrInvalidPart, ErrInvalidPartOrder,
 		ErrEntityTooSmall, ErrLockTimeout, ErrBackendUnavailable,
-		ErrDiskFull, ErrCorrupted, ErrNotImplemented,
+		ErrDiskFull, ErrCorrupted, ErrNotImplemented, ErrIllegalVersioning, ErrInvalidVersionID,
+		ErrObjectLocked, ErrObjectLockNotEnabled, ErrInvalidRetention, ErrInvalidBucketState,
 	}
 }
 

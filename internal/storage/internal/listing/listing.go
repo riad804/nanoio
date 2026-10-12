@@ -210,3 +210,98 @@ func PageUploads(all []storage.UploadInfo, opts storage.ListUploadsOptions) stor
 	}
 	return res
 }
+
+// PageVersions builds one ListObjectVersions page from keys (unique, any
+// order). load returns every version and delete marker of a key, newest
+// first, with IDs as reported to clients, or false to skip the key. Entries
+// are ordered by key (UTF-8 bytes) and, within a key, as load returned them.
+//
+// Resumption is strictly after (opts.Marker, opts.VersionIDMarker): with no
+// version marker the whole marker key is skipped; with one, the versions
+// that follow it are listed, and if it no longer exists the key is skipped
+// (the listing resumes at the next key, as S3 does). A common prefix and a
+// version each count one toward the page size. NextMarker and
+// NextVersionIDMarker name the last entry returned when the page is
+// truncated.
+func PageVersions(keys []string, opts storage.ListOptions, load func(key string) ([]storage.ObjectInfo, bool)) storage.ListVersionsResult {
+	limit := opts.MaxKeys
+	if limit <= 0 || limit > MaxKeys {
+		limit = MaxKeys
+	}
+	marker := max(opts.Marker, opts.StartAfter)
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+
+	var res storage.ListVersionsResult
+	var lastKey, lastVID string
+	count := 0
+	lastPrefix, havePrefix := "", false
+	full := func() bool { return count == limit }
+	for _, key := range sorted {
+		name, isPrefix := key, false
+		if opts.Delimiter != "" && strings.HasPrefix(key, opts.Prefix) {
+			rest := key[len(opts.Prefix):]
+			if i := strings.Index(rest, opts.Delimiter); i >= 0 {
+				name, isPrefix = opts.Prefix+rest[:i+len(opts.Delimiter)], true
+			}
+		}
+		if isPrefix {
+			if name <= marker || havePrefix && name == lastPrefix {
+				continue
+			}
+			if full() {
+				res.IsTruncated = true
+				break
+			}
+			res.Prefixes = append(res.Prefixes, name)
+			lastPrefix, havePrefix = name, true
+			lastKey, lastVID = name, ""
+			count++
+			continue
+		}
+		if key < marker {
+			continue
+		}
+		versions, ok := load(key)
+		if !ok || len(versions) == 0 {
+			continue
+		}
+		if key == marker {
+			if opts.VersionIDMarker == "" {
+				continue
+			}
+			rest := versionsAfter(versions, opts.VersionIDMarker)
+			if len(rest) == 0 {
+				continue
+			}
+			versions = rest
+		}
+		for _, v := range versions {
+			if full() {
+				res.IsTruncated = true
+				break
+			}
+			res.Versions = append(res.Versions, v)
+			lastKey, lastVID = key, v.VersionID
+			count++
+		}
+		if res.IsTruncated {
+			break
+		}
+	}
+	if res.IsTruncated {
+		res.NextMarker, res.NextVersionIDMarker = lastKey, lastVID
+	}
+	return res
+}
+
+// versionsAfter returns the versions that follow the one with the given
+// reported ID, or nil when it is not among them.
+func versionsAfter(vs []storage.ObjectInfo, id string) []storage.ObjectInfo {
+	for i, v := range vs {
+		if v.VersionID == id {
+			return vs[i+1:]
+		}
+	}
+	return nil
+}

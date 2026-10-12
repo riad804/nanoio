@@ -6,6 +6,7 @@ import (
 	"fmt"
 	iofs "io/fs"
 
+	"nanoio/internal/meta"
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/internal/fsutil"
 )
@@ -15,16 +16,17 @@ import (
 type Kind uint8
 
 const (
-	KindIO          Kind = 0 // anything unclassified
-	KindOffline     Kind = 1 // drive missing, unformatted, unreachable or failed
-	KindNotFound    Kind = 2 // bucket, object, upload, part or file absent
-	KindUnformatted Kind = 3 // blank drive, usable once formatted
-	KindForeign     Kind = 4 // populated directory without a format: never adopted
-	KindInUse       Kind = 5 // another process holds the drive
-	KindConflict    Kind = 6 // conditional commit lost to a newer generation
-	KindCorrupted   Kind = 7 // stored data failed verification
-	KindDiskFull    Kind = 8 // no space left
-	KindCanceled    Kind = 9 // context cancelled or deadline exceeded
+	KindIO          Kind = 0  // anything unclassified
+	KindOffline     Kind = 1  // drive missing, unformatted, unreachable or failed
+	KindNotFound    Kind = 2  // bucket, object, upload, part or file absent
+	KindUnformatted Kind = 3  // blank drive, usable once formatted
+	KindForeign     Kind = 4  // populated directory without a format: never adopted
+	KindInUse       Kind = 5  // another process holds the drive
+	KindConflict    Kind = 6  // conditional commit lost to a newer generation
+	KindCorrupted   Kind = 7  // stored data failed verification
+	KindDiskFull    Kind = 8  // no space left
+	KindCanceled    Kind = 9  // context cancelled or deadline exceeded
+	KindLocked      Kind = 10 // object lock refuses the change
 )
 
 var kindNames = map[Kind]string{
@@ -32,6 +34,7 @@ var kindNames = map[Kind]string{
 	KindUnformatted: "not formatted", KindForeign: "directory is not empty and has no format",
 	KindInUse: "in use by another process", KindConflict: "conflicting newer generation",
 	KindCorrupted: "corrupted", KindDiskFull: "disk full", KindCanceled: "canceled",
+	KindLocked: "protected by object lock",
 }
 
 func (k Kind) String() string {
@@ -81,6 +84,8 @@ func (e *Error) Is(target error) bool {
 		return target == storage.ErrCorrupted
 	case KindDiskFull:
 		return target == storage.ErrDiskFull
+	case KindLocked:
+		return target == storage.ErrObjectLocked
 	}
 	return false
 }
@@ -96,6 +101,7 @@ var (
 	ErrCorrupted   = &Error{Kind: KindCorrupted}
 	ErrDiskFull    = &Error{Kind: KindDiskFull}
 	ErrCanceled    = &Error{Kind: KindCanceled}
+	ErrLocked      = &Error{Kind: KindLocked}
 )
 
 // Wrap returns err as an *Error with op and path filled in, classifying it
@@ -130,6 +136,8 @@ func classify(err error) Kind {
 		return KindCanceled
 	case fsutil.IsNoSpace(err):
 		return KindDiskFull
+	case errors.Is(err, meta.ErrLocked), errors.Is(err, storage.ErrObjectLocked):
+		return KindLocked
 	case errors.Is(err, storage.ErrCorrupted):
 		return KindCorrupted
 	case errors.Is(err, iofs.ErrNotExist):

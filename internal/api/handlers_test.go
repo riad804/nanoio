@@ -49,6 +49,10 @@ var testIAMFile = &iam.File{
 		{AccessKey: "nobody", SecretKey: "nobody-secret-key"},
 		{AccessKey: "retired", SecretKey: "retired-secret-key", Status: "disabled", Policies: []string{"readwrite"}},
 		{AccessKey: "uploader", SecretKey: "uploader-secret-key", Policies: []string{"mp-full"}},
+		// Both work on the object lock test bucket; only "governor" may
+		// bypass governance retention.
+		{AccessKey: "locker", SecretKey: "locker-secret-key", Policies: []string{"lock-ops"}},
+		{AccessKey: "governor", SecretKey: "governor-secret-key", Policies: []string{"lock-ops", "lock-bypass"}},
 	},
 	Policies: map[string]json.RawMessage{
 		// Everything multipart needs on one bucket, and nothing else.
@@ -56,6 +60,14 @@ var testIAMFile = &iam.File{
 			{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject","s3:AbortMultipartUpload",
 			 "s3:ListMultipartUploadParts"],"Resource":"arn:aws:s3:::mpa/*"},
 			{"Effect":"Allow","Action":["s3:ListBucketMultipartUploads","s3:ListBucket"],"Resource":"arn:aws:s3:::mpa"}]}`),
+		"lock-ops": json.RawMessage(`{"Version":"2012-10-17","Statement":[
+			{"Effect":"Allow","Action":["s3:PutObject","s3:GetObject","s3:GetObjectVersion","s3:DeleteObject",
+			 "s3:DeleteObjectVersion","s3:PutObjectRetention","s3:GetObjectRetention","s3:PutObjectLegalHold",
+			 "s3:GetObjectLegalHold"],"Resource":"arn:aws:s3:::lockapi/*"},
+			{"Effect":"Allow","Action":["s3:ListBucket","s3:ListBucketVersions","s3:GetBucketObjectLockConfiguration"],
+			 "Resource":"arn:aws:s3:::lockapi"}]}`),
+		"lock-bypass": json.RawMessage(`{"Version":"2012-10-17","Statement":[
+			{"Effect":"Allow","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::lockapi/*"}]}`),
 		"pub-only": json.RawMessage(`{"Version":"2012-10-17","Statement":[
 			{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::scoped/pub/*"},
 			{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::scoped",
@@ -67,17 +79,20 @@ func signerFor(ak string) auth.Signer {
 	secrets := map[string]string{
 		rootAK: rootSK, "reader": "reader-secret-key", "writer": "writer-secret-key",
 		"scoped": "scoped-secret-key", "nobody": "nobody-secret-key", "retired": "retired-secret-key",
-		"uploader": "uploader-secret-key",
+		"uploader": "uploader-secret-key", "locker": "locker-secret-key", "governor": "governor-secret-key",
 	}
 	return auth.Signer{AccessKey: ak, SecretKey: secrets[ak]}
 }
 
 type testEnv struct {
-	t    *testing.T
-	srv  *httptest.Server
-	fs   *fs.FS
-	host string // host:port of srv
-	root auth.Signer
+	t   *testing.T
+	srv *httptest.Server
+	st  storage.StorageAPI
+	// drives are the xl drive directories, when the backend is xl.
+	drives []string
+	fs     *fs.FS
+	host   string // host:port of srv
+	root   auth.Signer
 }
 
 // newEnv serves a real fs backend over HTTP with authentication on.
@@ -91,23 +106,27 @@ func newEnv(t *testing.T) *testEnv {
 	return serve(t, be, be)
 }
 
-func serve(t *testing.T, st storage.StorageAPI, be *fs.FS) *testEnv {
+func serve(t *testing.T, st storage.StorageAPI, be *fs.FS, mutate ...func(*Options)) *testEnv {
 	t.Helper()
 	store, err := iam.New(iam.Credential{AccessKey: rootAK, SecretKey: rootSK}, testIAMFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := New(Options{
+	opts := Options{
 		Storage: st, Auth: &auth.Verifier{Provider: store, Region: "us-east-1"}, Authz: store,
 		Domains: []string{"localhost"}, Region: "us-east-1", Logger: quiet,
-	})
+	}
+	for _, m := range mutate {
+		m(&opts)
+	}
+	h, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	u, _ := url.Parse(srv.URL)
-	return &testEnv{t: t, srv: srv, fs: be, host: u.Host, root: signerFor(rootAK)}
+	return &testEnv{t: t, srv: srv, st: st, fs: be, host: u.Host, root: signerFor(rootAK)}
 }
 
 type hdr map[string]string
@@ -516,7 +535,8 @@ func TestPutValidation(t *testing.T) {
 		{"sha256 mismatch", "/val/shabad", "abc", hdr{"x-amz-content-sha256": sha256hex("other")}, 400, "XAmzContentSHA256Mismatch", "shabad"},
 		{"sha256 junk", "/val/shajunk", "abc", hdr{"x-amz-content-sha256": "nothex"}, 400, "InvalidArgument", "shajunk"},
 		{"unsigned payload", "/val/unsigned", "abc", hdr{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, 200, "", ""},
-		{"copy is refused", "/val/copy", "", hdr{"x-amz-copy-source": "/val/existing"}, 501, "NotImplemented", "copy"},
+		{"copy of a missing source", "/val/copy", "", hdr{"x-amz-copy-source": "/val/no-such-source"}, 404, "NoSuchKey", "copy"},
+		{"copy with a bad source", "/val/copybad", "", hdr{"x-amz-copy-source": "nobucketslash"}, 400, "InvalidArgument", "copybad"},
 		{"tagging is refused", "/val/tagged", "x", hdr{"x-amz-tagging": "a=b"}, 501, "NotImplemented", "tagged"},
 		{"metadata too large", "/val/bigmeta", "x", hdr{"x-amz-meta-big": strings.Repeat("a", 2100)}, 400, "MetadataTooLarge", "bigmeta"},
 		{"if-none-match on existing", "/val/existing", "v2", hdr{"If-None-Match": "*"}, 412, "PreconditionFailed", ""},
@@ -1285,7 +1305,7 @@ func TestDeleteObjects(t *testing.T) {
 		for _, x := range r.Errors {
 			codes[x.Key] = x.Code
 		}
-		if codes["a//b"] != "XNanoIOInvalidObjectName" || codes["v"] != "NotImplemented" {
+		if codes["a//b"] != "XNanoIOInvalidObjectName" || codes["v"] != "InvalidArgument" {
 			t.Errorf("errors = %+v", r.Errors)
 		}
 		if len(r.Deleted) != 1 || r.Deleted[0].Key != "keep" {
@@ -1327,9 +1347,6 @@ func TestUnsupportedFeaturesAreRefused(t *testing.T) {
 	}{
 		{"PUT", "/ghostbucket?acl"},
 		{"PUT", "/uns?acl"},
-		{"PUT", "/uns?versioning"},
-		{"GET", "/uns?versioning"},
-		{"GET", "/uns?versions"},
 		{"GET", "/uns?policy"},
 		{"PUT", "/uns?policy"},
 		{"DELETE", "/uns?policy"},
@@ -1340,7 +1357,7 @@ func TestUnsupportedFeaturesAreRefused(t *testing.T) {
 		{"GET", "/uns/obj?tagging"},
 		{"PUT", "/uns/obj?tagging"},
 		{"DELETE", "/uns/obj?tagging"},
-		{"GET", "/uns/obj?retention"},
+		{"GET", "/uns/obj?restore"},
 		{"GET", "/uns/obj?partNumber=2"}, // reading one part of a finished object
 		{"PUT", "/uns/obj?partNumber=1"}, // a part number with no upload id
 		{"POST", "/uns/obj?select&select-type=2"},
@@ -1357,10 +1374,10 @@ func TestUnsupportedFeaturesAreRefused(t *testing.T) {
 	if got, _ := e.get("/uns/obj"); got != "original" {
 		t.Errorf("a refused request modified the object: %q", got)
 	}
-	if r, _ := e.do("DELETE", "/uns/obj?versionId=abc", nil, nil); r.StatusCode != 501 {
-		t.Errorf("versioned delete = %d", r.StatusCode)
-	}
+	// Version IDs are validated, and an unknown (well-formed) one is not found.
 	resp, body := e.do("GET", "/uns/obj?versionId=abc", nil, nil)
+	wantError(t, resp, body, 400, "InvalidArgument")
+	resp, body = e.do("GET", "/uns/obj?versionId=9f0c1b9e-1111-4222-8333-444455556666", nil, nil)
 	wantError(t, resp, body, 404, "NoSuchVersion")
 }
 

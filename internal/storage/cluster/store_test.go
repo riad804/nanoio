@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"nanoio/internal/bucket/nslock"
+	"nanoio/internal/sse"
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/storagetest"
 	"nanoio/internal/storage/xl"
@@ -104,6 +106,20 @@ func setHolding(s *Store, b, k string) []int {
 
 func TestConformance(t *testing.T) {
 	storagetest.Run(t, func(t *testing.T, locker storage.Locker) storage.StorageAPI {
+		tp := topo{root: t.TempDir(), locker: locker}
+		return open(t, tp, Options{}, tp.pools(t, []string{"a", "b"}, []string{"c"}))
+	})
+}
+
+func TestVersionedConformance(t *testing.T) {
+	storagetest.RunVersioned(t, func(t *testing.T, locker storage.Locker) storage.StorageAPI {
+		tp := topo{root: t.TempDir(), locker: locker}
+		return open(t, tp, Options{}, tp.pools(t, []string{"a", "b"}, []string{"c"}))
+	})
+}
+
+func TestObjectLockConformance(t *testing.T) {
+	storagetest.RunObjectLock(t, func(t *testing.T, locker storage.Locker) storage.StorageAPI {
 		tp := topo{root: t.TempDir(), locker: locker}
 		return open(t, tp, Options{}, tp.pools(t, []string{"a", "b"}, []string{"c"}))
 	})
@@ -576,5 +592,140 @@ func TestEveryPoolDrainingRefusesWrites(t *testing.T) {
 	_, err := s.PutObject(bg, "none", "k", strings.NewReader("v"), 1, storage.PutOptions{})
 	if !errors.Is(err, ErrNoPlacement) {
 		t.Errorf("err = %v, want ErrNoPlacement", err)
+	}
+}
+
+// A multipart object must move part for part: same parts, same composite
+// ETag, same metadata (encrypted objects depend on all three).
+func TestDrainPreservesMultipart(t *testing.T) {
+	tp := newTopo(t)
+	pools := tp.pools(t, []string{"a"}, []string{"b"})
+	s := open(t, tp, Options{}, pools)
+	s.MakeBucket(bg, "mpd", storage.MakeBucketOptions{})
+	big := strings.Repeat("p", 5<<20)
+	var keys []string
+	for i := 0; len(keys) < 3 && i < 200; i++ {
+		k := fmt.Sprintf("mp-%03d", i)
+		id, err := s.NewMultipartUpload(bg, "mpd", k, storage.PutOptions{
+			ContentType: "x/y", UserDefined: map[string]string{"x-nanoio-internal-sse-mode": "c", "x-amz-meta-a": "b"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p1, err := s.PutObjectPart(bg, "mpd", k, id, 1, strings.NewReader(big), int64(len(big)), storage.PartOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p2, err := s.PutObjectPart(bg, "mpd", k, id, 7, strings.NewReader("tail"), 4, storage.PartOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CompleteMultipartUpload(bg, "mpd", k, id,
+			[]storage.CompletePart{{Number: 1, ETag: p1.ETag}, {Number: 7, ETag: p2.ETag}}, storage.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if h := setHolding(s, "mpd", k); len(h) == 1 && h[0] == 0 {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		t.Fatal("no multipart object landed in pool 0")
+	}
+	before := map[string]storage.ObjectInfo{}
+	for _, k := range keys {
+		before[k], _ = s.StatObject(bg, "mpd", k, storage.GetOptions{})
+	}
+	s.Close()
+
+	pools2 := tp.pools(t, []string{"a"}, []string{"b"})
+	pools2[0].Draining = true
+	d := open(t, tp, Options{}, pools2)
+	st, err := d.Drain(bg, 0)
+	if err != nil || st.Failed != 0 {
+		t.Fatalf("drain: %+v, %v", st, err)
+	}
+	for _, k := range keys {
+		info, err := d.StatObject(bg, "mpd", k, storage.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := before[k]
+		if info.ETag != b.ETag || len(info.Parts) != 2 || info.Parts[1].Number != 7 || info.Parts[0].Size != int64(len(big)) {
+			t.Errorf("%s after drain: ETag %s parts %+v, before ETag %s", k, info.ETag, info.Parts, b.ETag)
+		}
+		if info.UserDefined["x-nanoio-internal-sse-mode"] != "c" || info.ContentType != "x/y" {
+			t.Errorf("%s lost metadata: %+v", k, info)
+		}
+		if h := setHolding(d, "mpd", k); len(h) != 1 || h[0] != 1 {
+			t.Errorf("%s on %v", k, h)
+		}
+	}
+}
+
+// An encrypted multipart object (two independently keyed part streams)
+// still decrypts after a drain, because drain keeps the part layout.
+func TestDrainedEncryptedMultipartObjectDecrypts(t *testing.T) {
+	tp := newTopo(t)
+	pools := tp.pools(t, []string{"a"}, []string{"b"})
+	s := open(t, tp, Options{}, pools)
+	s.MakeBucket(bg, "encdrn", storage.MakeBucketOptions{})
+	ok := make([]byte, 32)
+	for i := range ok {
+		ok[i] = byte(i + 1)
+	}
+	plain := [][]byte{[]byte(strings.Repeat("A", 5<<20+9)), []byte("the second part")}
+	var key string
+	for i := 0; i < 200 && key == ""; i++ {
+		k := fmt.Sprintf("enc-%03d", i)
+		id, err := s.NewMultipartUpload(bg, "encdrn", k, storage.PutOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var parts []storage.CompletePart
+		for n, p := range plain {
+			ct, _ := io.ReadAll(sse.NewEncrypter(bytes.NewReader(p), sse.PartKey(ok, n+1)))
+			pi, err := s.PutObjectPart(bg, "encdrn", k, id, n+1, bytes.NewReader(ct), int64(len(ct)), storage.PartOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			parts = append(parts, storage.CompletePart{Number: n + 1, ETag: pi.ETag})
+		}
+		if _, err := s.CompleteMultipartUpload(bg, "encdrn", k, id, parts, storage.PutOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if h := setHolding(s, "encdrn", k); len(h) == 1 && h[0] == 0 {
+			key = k
+		}
+	}
+	if key == "" {
+		t.Fatal("no object landed in pool 0")
+	}
+	s.Close()
+	pools2 := tp.pools(t, []string{"a"}, []string{"b"})
+	pools2[0].Draining = true
+	d := open(t, tp, Options{}, pools2)
+	if st, err := d.Drain(bg, 0); err != nil || st.Failed != 0 {
+		t.Fatalf("drain: %+v %v", st, err)
+	}
+	rc, info, err := d.GetObject(bg, "encdrn", key, storage.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	var layout sse.Layout
+	for _, p := range info.Parts {
+		layout = append(layout, sse.PartLayout{Number: p.Number, CipherSize: p.Size})
+	}
+	size, err := layout.PlainSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec, err := sse.NewDecrypter(rc, layout, ok, 0, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(dec)
+	want := append(append([]byte(nil), plain[0]...), plain[1]...)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("decrypt after drain: err=%v equal=%v", err, bytes.Equal(got, want))
 	}
 }

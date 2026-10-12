@@ -402,7 +402,7 @@ func TestUploadPartCopy(t *testing.T) {
 		if resp.StatusCode != 200 {
 			t.Fatalf("%d %s", resp.StatusCode, body)
 		}
-		resp, body = copyTo(hdr{"x-amz-copy-source": "/cps/source.bin?versionId=nope", "x-amz-copy-source-range": "bytes=0-1"})
+		resp, body = copyTo(hdr{"x-amz-copy-source": "/cps/source.bin?versionId=9f0c1b9e-1111-4222-8333-444455556666", "x-amz-copy-source-range": "bytes=0-1"})
 		wantError(t, resp, body, 404, "NoSuchVersion")
 	})
 	errs := []struct {

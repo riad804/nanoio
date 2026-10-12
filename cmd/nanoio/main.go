@@ -66,7 +66,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	interTLS := flags.String("inter-node-tls-required", "", "distributed mode: true (default) or false; false is for development clusters only")
 	flags.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: nanoio [--config file] (--root dir | --drives d1,d2,... [--parity n] | cluster config) [--address host:port]\n")
-		fmt.Fprintf(stderr, "       nanoio admin (status | scan [--deep] | decommission --pool N) [--config file]\n\n")
+		fmt.Fprintf(stderr, "       nanoio admin (status | scan [--deep] | decommission --pool N | rewrap [--endpoint url]) [--config file]\n\n")
 		flags.PrintDefaults()
 		fmt.Fprintf(stderr, "\nPrecedence: defaults < config file < NANOIO_* environment < flags.\n")
 	}
@@ -168,6 +168,16 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		apiOpts.Auth = &auth.Verifier{Provider: store, Region: cfg.Region}
 		apiOpts.Authz = store
 		logger.Info("authentication enabled", "root", cfg.RootUser, "users", store.UserCount(), "iamFile", cfg.IAMFile)
+	}
+
+	if k, err := newKMS(cfg.KMS, logger); err != nil {
+		return err
+	} else if k != nil {
+		apiOpts.KMS, apiOpts.DefaultKMSKey = k, cfg.KMS.DefaultKey
+	}
+	apiOpts.AllowInsecureSSEC = cfg.AllowInsecureSSEC
+	if cfg.AllowInsecureSSEC {
+		logger.Warn("SSE-C keys are accepted over connections that are not TLS: an on-path observer can read them")
 	}
 
 	gcInterval := cfg.GCInterval.D()
@@ -383,8 +393,9 @@ func runAdmin(ctx context.Context, args []string, getenv func(string) string, st
 	target := flags.String("node", "", "node to call (default: the config's own node)")
 	pool := flags.Int("pool", -1, "decommission: pool index")
 	deep := flags.Bool("deep", false, "scan: verify every block's hash")
+	endpoint := flags.String("endpoint", "", "rewrap: base URL of the server (default: the config's address)")
 	if len(args) == 0 {
-		return errors.New("admin: need a command: status, scan or decommission")
+		return errors.New("admin: need a command: status, scan, decommission or rewrap")
 	}
 	cmd := args[0]
 	if err := flags.Parse(args[1:]); err != nil {
@@ -397,6 +408,9 @@ func runAdmin(ctx context.Context, args []string, getenv func(string) string, st
 	cfg, err := config.Load(path, getenv)
 	if err != nil {
 		return err
+	}
+	if cmd == "rewrap" {
+		return runRewrap(ctx, cfg, *endpoint, stdout)
 	}
 	cl := cfg.Cluster
 	if cl == nil || len(cl.Secrets) == 0 || len(cl.Nodes) == 0 {

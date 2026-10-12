@@ -28,6 +28,7 @@ import (
 
 	"nanoio/internal/auth"
 	"nanoio/internal/iam"
+	"nanoio/internal/kms"
 	"nanoio/internal/storage"
 )
 
@@ -69,6 +70,17 @@ type Options struct {
 	// virtual-host request whose key happens to start with "_nanoio/" is
 	// still an object request.
 	Internal http.Handler
+
+	// KMS enables SSE-S3 and SSE-KMS (and bucket default encryption). Nil
+	// means those modes answer 501; SSE-C needs no KMS.
+	KMS kms.KMS
+	// DefaultKMSKey is the key SSE-S3 uses and SSE-KMS defaults to. Required
+	// when KMS is set.
+	DefaultKMSKey string
+	// AllowInsecureSSEC accepts SSE-C keys over a connection that is not
+	// TLS. Off by default; for development and for deployments where a
+	// trusted proxy terminates TLS.
+	AllowInsecureSSEC bool
 }
 
 // InternalPrefix is the reserved internal namespace.
@@ -84,6 +96,11 @@ type Server struct {
 	region   string
 	log      *slog.Logger
 	internal http.Handler
+
+	kms               kms.KMS
+	defaultKey        string
+	allowInsecureSSEC bool
+	encCache          encConfigCache
 }
 
 // New validates opts and returns the handler.
@@ -92,7 +109,11 @@ func New(opts Options) (*Server, error) {
 		return nil, errors.New("api: Options.Storage is required")
 	}
 	s := &Server{st: opts.Storage, region: opts.Region, log: opts.Logger,
-		authn: opts.Auth, authz: opts.Authz, noAuth: opts.InsecureNoAuth, internal: opts.Internal}
+		authn: opts.Auth, authz: opts.Authz, noAuth: opts.InsecureNoAuth, internal: opts.Internal,
+		kms: opts.KMS, defaultKey: opts.DefaultKMSKey, allowInsecureSSEC: opts.AllowInsecureSSEC}
+	if s.kms != nil && s.defaultKey == "" {
+		return nil, errors.New("api: Options.DefaultKMSKey is required with Options.KMS")
+	}
 	if !s.noAuth && (s.authn == nil || s.authz == nil) {
 		return nil, errors.New("api: Options.Auth and Options.Authz are required (set InsecureNoAuth to disable authentication explicitly)")
 	}
@@ -160,6 +181,10 @@ func newRequestID() string {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == InternalPrefix+"admin/rewrap" {
+		s.serveAdmin(w, r)
+		return
+	}
 	if s.internal != nil && strings.HasPrefix(r.URL.Path, InternalPrefix) {
 		if _, vhost := s.hostBucket(r.Host); !vhost {
 			s.internal.ServeHTTP(w, r)
@@ -200,6 +225,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		q.who, q.res = res.AccessKey, res
 	}
+	if q.bucket == sysBucket {
+		// NanoIO's own configuration bucket is not part of the S3 namespace.
+		if q.key == "" && r.Method == http.MethodPut {
+			s.fail(q, storage.ErrInvalidBucketName)
+		} else {
+			s.fail(q, storage.ErrBucketNotFound)
+		}
+		return
+	}
 	switch {
 	case q.bucket == "":
 		s.serviceOp(q)
@@ -208,6 +242,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.objectOp(q)
 	}
+}
+
+// serveAdmin authenticates an admin request with the ordinary S3
+// credentials, then dispatches it.
+func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request) {
+	sw := &statusWriter{ResponseWriter: w}
+	q := &request{w: sw, r: r, id: newRequestID(), query: r.URL.Query()}
+	sw.Header().Set("Server", "NanoIO")
+	sw.Header().Set("x-amz-request-id", q.id)
+	if !s.noAuth {
+		res, err := s.authn.Authenticate(r)
+		if err != nil {
+			s.fail(q, err)
+			return
+		}
+		q.who, q.res = res.AccessKey, res
+	}
+	s.adminRewrap(sw, r, q)
 }
 
 // target resolves the bucket and key of a request. A Host that is a
@@ -239,6 +291,18 @@ func (s *Server) hostBucket(host string) (string, bool) {
 
 // fail writes err as an S3 error response.
 func (s *Server) fail(q *request, err error) {
+	var dm *storage.DeleteMarkerError
+	if errors.As(err, &dm) {
+		// S3 identifies the marker that answered the request.
+		h := q.w.Header()
+		h.Set("x-amz-delete-marker", "true")
+		if dm.VersionID != "" {
+			h.Set("x-amz-version-id", dm.VersionID)
+		}
+		if dm.Explicit {
+			h.Set("Last-Modified", dm.ModTime.UTC().Format(http.TimeFormat))
+		}
+	}
 	ae, respond, known := classify(err)
 	if !known {
 		s.log.Error("request failed", "id", q.id, "method", q.r.Method,
@@ -337,16 +401,16 @@ func (q *request) firstOf(names []string) string {
 // must not create a bucket).
 var (
 	bucketSubresources = []string{
-		"accelerate", "acl", "analytics", "cors", "encryption", "intelligent-tiering",
-		"inventory", "lifecycle", "logging", "metrics", "notification", "object-lock",
+		"accelerate", "acl", "analytics", "cors", "intelligent-tiering",
+		"inventory", "lifecycle", "logging", "metrics", "notification",
 		"policy", "policyStatus", "publicAccessBlock", "replication", "requestPayment",
-		"tagging", "versioning", "versions", "website", "ownershipControls",
+		"tagging", "website", "ownershipControls",
 	}
 	// partNumber is listed because GET ?partNumber=N (read one part of a
 	// finished object) is not implemented; PUT ?partNumber&uploadId is
 	// routed to UploadPart before this check.
 	objectSubresources = []string{
-		"acl", "attributes", "legal-hold", "partNumber", "restore", "retention",
+		"acl", "attributes", "partNumber", "restore",
 		"select", "tagging", "torrent",
 	}
 )
@@ -370,6 +434,32 @@ func (s *Server) bucketOp(q *request) {
 		return
 	case m == http.MethodGet && q.has("uploads"):
 		s.listMultipartUploads(q)
+		return
+	case m == http.MethodGet && q.has("versions"):
+		s.listObjectVersions(q)
+		return
+	case q.has("object-lock"):
+		switch m {
+		case http.MethodPut:
+			s.putObjectLockConfiguration(q)
+		case http.MethodGet:
+			s.getObjectLockConfiguration(q)
+		default:
+			s.fail(q, errBadMethod)
+		}
+		return
+	case q.has("encryption"):
+		s.bucketEncryptionOp(q)
+		return
+	case q.has("versioning"):
+		switch m {
+		case http.MethodPut:
+			s.putBucketVersioning(q)
+		case http.MethodGet:
+			s.getBucketVersioning(q)
+		default:
+			s.fail(q, errBadMethod)
+		}
 		return
 	}
 	if sub := q.firstOf(bucketSubresources); sub != "" {
@@ -397,6 +487,10 @@ func (s *Server) bucketOp(q *request) {
 func (s *Server) objectOp(q *request) {
 	if q.has("uploads") || q.has("uploadId") {
 		s.multipartOp(q)
+		return
+	}
+	if sub := q.firstOf([]string{"retention", "legal-hold"}); sub != "" {
+		s.objectLockOp(q, sub)
 		return
 	}
 	if sub := q.firstOf(objectSubresources); sub != "" {

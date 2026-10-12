@@ -103,6 +103,18 @@ func TestDistributedSet(t *testing.T) {
 		})
 	})
 
+	t.Run("versioned objects over mixed local and remote drives", func(t *testing.T) {
+		storagetest.RunVersioned(t, func(t *testing.T, locker storage.Locker) storage.StorageAPI {
+			return newThreeNodes(t, locker).x
+		})
+	})
+
+	t.Run("object lock over mixed local and remote drives", func(t *testing.T) {
+		storagetest.RunObjectLock(t, func(t *testing.T, locker storage.Locker) storage.StorageAPI {
+			return newThreeNodes(t, locker).x
+		})
+	})
+
 	t.Run("a lost node costs neither reads nor writes; heal brings it back", func(t *testing.T) {
 		tn := newThreeNodes(t)
 		x := tn.x
@@ -118,7 +130,7 @@ func TestDistributedSet(t *testing.T) {
 		put(t, x, "dist", "during", body+"!") // 4 of 6 drives: write quorum K=4
 
 		tn.net.Restart("n3:9000")
-		settle()
+		waitOnline(t, x, 6)
 		stats, err := x.Scan(bg, true)
 		if err != nil {
 			t.Fatal(err)
@@ -128,10 +140,7 @@ func TestDistributedSet(t *testing.T) {
 		}
 		// Every object is whole on every drive again.
 		for _, key := range []string{"before", "during"} {
-			res, err := x.HealObject(bg, "dist", key, true)
-			if err != nil || res.Skipped != "healthy" {
-				t.Errorf("%s after scan: %+v, %v", key, res, err)
-			}
+			eventuallyHealthy(t, x, "dist", key)
 		}
 	})
 
@@ -150,7 +159,7 @@ func TestDistributedSet(t *testing.T) {
 			t.Error("a read succeeded with fewer than K drives")
 		}
 		tn.net.Heal()
-		settle()
+		waitOnline(t, x, 6)
 		if got := mustRead(t, x, "dist", "k"); got != "v" {
 			t.Errorf("data after the partition healed = %q", got)
 		}
@@ -179,4 +188,17 @@ func TestDistributedSet(t *testing.T) {
 			t.Errorf("after scan: %+v, %v", res, err)
 		}
 	})
+}
+
+// waitOnline waits for the circuit breakers of returned remote drives to
+// let probes through again.
+func waitOnline(t *testing.T, x *XL, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for x.OnlineDrives() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d drives came back", x.OnlineDrives(), want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

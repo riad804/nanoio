@@ -19,6 +19,7 @@ import (
 	"nanoio/internal/meta"
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/internal/fsutil"
+	"nanoio/internal/storage/internal/objlock"
 )
 
 // ctxReader fails reads once ctx is done so a cancelled upload stops
@@ -55,9 +56,9 @@ func copyMap(m map[string]string) map[string]string {
 
 func trimETag(s string) string { return strings.Trim(s, `"`) }
 
-func toInfo(bucket, object string, v *meta.Version, latest bool) storage.ObjectInfo {
+func toInfo(bucket, object string, v *meta.Version, latest bool, state storage.VersioningState) storage.ObjectInfo {
 	info := storage.ObjectInfo{
-		Bucket: bucket, Name: object, VersionID: v.VersionID, IsLatest: latest,
+		Bucket: bucket, Name: object, VersionID: storage.ReportedVersionID(state, v.VersionID), IsLatest: latest,
 		DeleteMarker: v.Type == meta.TypeDeleteMarker,
 		Size:         v.Size, ModTime: v.ModTime, ETag: v.ETag,
 		ContentType: v.ContentType, UserDefined: copyMap(v.UserMeta),
@@ -65,6 +66,7 @@ func toInfo(bucket, object string, v *meta.Version, latest bool) storage.ObjectI
 	for _, p := range v.Parts {
 		info.Parts = append(info.Parts, storage.PartInfo{Number: p.N, ETag: p.ETag, Size: p.Size})
 	}
+	info.Retention, info.LegalHold = objlock.Info(v.Lock)
 	return info
 }
 
@@ -75,9 +77,6 @@ func (f *FS) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 	var zero storage.ObjectInfo
 	if err := validate(bucket, object); err != nil {
 		return zero, err
-	}
-	if opts.Versioned {
-		return zero, notImpl("versioned PutObject")
 	}
 	if size > maxObjectSize {
 		return zero, storage.Wrap(storage.ErrEntityTooLarge, bucket, object)
@@ -142,7 +141,7 @@ func (f *FS) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 	}
 	return f.commit(bucket, object, stage, stagedData, meta.Version{
 		Type: meta.TypeObject, Size: n, ETag: etag,
-		DataDir: dataDir, ContentType: ct, UserMeta: copyMap(opts.UserDefined),
+		DataDir: dataDir, ContentType: ct, UserMeta: opts.FinalUserDefined(),
 		Parts: []meta.Part{{N: 1, Size: n, ETag: etag}},
 	}, opts, hit)
 }
@@ -219,14 +218,22 @@ func (s *faultState) hit(point string) error {
 	return nil
 }
 
-// commit publishes a staged data directory as the new null version of
+// commit publishes a staged data directory as a new version of
 // bucket/object. The caller holds the bucket's shared lock and the key's
 // exclusive lock, has fully written and fsynced stagedData (a directory
 // inside stageDir whose name is ver.DataDir), and has filled in every field
-// of ver except VersionID and ModTime.
+// of ver except VersionID, Seq and ModTime.
+//
+// Because the bucket's shared lock is held, the versioning state read here
+// cannot change before the commit is done: the write is entirely before or
+// entirely after any change of state.
 func (f *FS) commit(bucket, object, stageDir, stagedData string, ver meta.Version, opts storage.PutOptions, hit func(string) error) (storage.ObjectInfo, error) {
 	var zero storage.ObjectInfo
 	if err := f.requireBucket(bucket); err != nil {
+		return zero, err
+	}
+	cfg, err := f.versioningOf(bucket)
+	if err != nil {
 		return zero, err
 	}
 	bucketDir, _ := f.path(bucket)
@@ -243,7 +250,7 @@ func (f *FS) commit(bucket, object, stageDir, stagedData string, ver meta.Versio
 	var cur *meta.Version
 	if file != nil {
 		if v := file.Latest(); v != nil && v.Type == meta.TypeObject {
-			cur = v
+			cur = v // a latest delete marker counts as "does not exist"
 		}
 	}
 	if opts.IfNoneMatch == "*" && cur != nil {
@@ -255,14 +262,29 @@ func (f *FS) commit(bucket, object, stageDir, stagedData string, ver meta.Versio
 	if file == nil {
 		file = &meta.File{Format: meta.FormatVersion}
 	}
-	oldDataDir := ""
-	if old := file.Find(""); old != nil {
-		oldDataDir = old.DataDir
+	id, err := meta.VersionIDFor(metaVersioning(cfg.State))
+	if err != nil {
+		return zero, err
 	}
-	ver.VersionID = ""
-	ver.ModTime = time.Now().UTC()
+	// The bucket's lock configuration cannot change while the shared bucket
+	// lock is held, so what is applied here is what the bucket says now.
+	lockCfg, err := f.objectLockOf(bucket)
+	if err != nil {
+		return zero, err
+	}
+	now := time.Now().UTC()
+	ver.Lock, err = objlock.Resolve(lockCfg.cfg, opts, now)
+	if err != nil {
+		return zero, storage.Wrap(err, bucket, object)
+	}
+	ver.VersionID = id
+	ver.Seq = file.Generation() + 1
+	ver.ModTime = now
 	dataDir := ver.DataDir
-	file.Add(ver)
+	superseded, err := file.ApplyPut(ver, objlock.Guard(now, false))
+	if err != nil {
+		return zero, objlock.Err(err, bucket, object)
+	}
 	enc, err := meta.Encode(file)
 	if err != nil {
 		return zero, err
@@ -309,48 +331,61 @@ func (f *FS) commit(bucket, object, stageDir, stagedData string, ver meta.Versio
 		return zero, err
 	}
 
-	// Committed. Drop the replaced version's data; a failure here only
-	// leaves garbage for the collector.
-	if oldDataDir != "" && oldDataDir != dataDir {
-		if err := f.pins.Remove(filepath.Join(keyDir, oldDataDir)); err != nil {
+	// Committed. Drop the replaced null version's data; a failure here only
+	// leaves garbage for the collector. Other versions are untouched.
+	for _, old := range superseded {
+		if old == dataDir {
+			continue
+		}
+		if err := f.pins.Remove(filepath.Join(keyDir, old)); err != nil {
 			f.log.Warn("fs: could not remove replaced data dir", "bucket", bucket, "object", object, "err", err)
 		}
 	}
-	return toInfo(bucket, object, file.Find(""), true), nil
+	return toInfo(bucket, object, file.Find(id), true, cfg.State), nil
 }
 
 // lookup resolves bucket/object[/versionID] to a version and its directory.
-// The caller holds the key lock.
-func (f *FS) lookup(bucket, object, versionID string) (*meta.Version, bool, string, error) {
+// The caller holds the key lock. A delete marker is reported as a
+// *storage.DeleteMarkerError: "not found" when the latest version was
+// asked for, "method not allowed" when the marker was named.
+func (f *FS) lookup(bucket, object, versionID string) (*meta.Version, bool, string, storage.VersioningState, error) {
 	keyDir, err := f.keyDir(bucket, object)
 	if err != nil {
-		return nil, false, "", err
+		return nil, false, "", "", err
+	}
+	stored, err := storage.StoredVersionID(versionID)
+	if err != nil {
+		return nil, false, "", "", storage.Wrap(err, bucket, object)
 	}
 	file, err := f.readMeta(keyDir)
 	if err != nil {
-		return nil, false, "", storage.Wrap(err, bucket, object)
+		return nil, false, "", "", storage.Wrap(err, bucket, object)
 	}
 	if file == nil || len(file.Versions) == 0 {
 		if err := f.requireBucket(bucket); err != nil {
-			return nil, false, "", err
+			return nil, false, "", "", err
 		}
-		return nil, false, "", storage.Wrap(storage.ErrObjectNotFound, bucket, object)
-	}
-	if versionID == "" {
-		v := file.Latest()
-		if v.Type == meta.TypeDeleteMarker {
-			return nil, false, "", storage.Wrap(storage.ErrObjectNotFound, bucket, object)
+		if versionID != "" {
+			return nil, false, "", "", storage.Wrap(storage.ErrVersionNotFound, bucket, object)
 		}
-		return v, true, keyDir, nil
+		return nil, false, "", "", storage.Wrap(storage.ErrObjectNotFound, bucket, object)
 	}
-	v := file.Find(versionID)
-	if v == nil {
-		return nil, false, "", storage.Wrap(storage.ErrVersionNotFound, bucket, object)
+	cfg, err := f.versioningOf(bucket)
+	if err != nil {
+		return nil, false, "", "", err
+	}
+	explicit := versionID != ""
+	v, rerr := file.Resolve(stored, !explicit)
+	if rerr != nil {
+		return nil, false, "", "", storage.Wrap(storage.ErrVersionNotFound, bucket, object)
 	}
 	if v.Type == meta.TypeDeleteMarker {
-		return nil, false, "", storage.Wrap(storage.ErrIsDeleteMarker, bucket, object)
+		return nil, false, "", "", &storage.DeleteMarkerError{
+			Bucket: bucket, Object: object, ModTime: v.ModTime, Explicit: explicit,
+			VersionID: storage.ReportedVersionID(cfg.State, v.VersionID),
+		}
 	}
-	return v, v == file.Latest(), keyDir, nil
+	return v, v == file.Latest(), keyDir, cfg.State, nil
 }
 
 // StatObject returns object metadata without opening its data.
@@ -367,11 +402,11 @@ func (f *FS) StatObject(ctx context.Context, bucket, object string, opts storage
 		return storage.ObjectInfo{}, err
 	}
 	defer unlock()
-	v, latest, _, err := f.lookup(bucket, object, opts.VersionID)
+	v, latest, _, state, err := f.lookup(bucket, object, opts.VersionID)
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}
-	return toInfo(bucket, object, v, latest), nil
+	return toInfo(bucket, object, v, latest, state), nil
 }
 
 // readCloser pairs a section reader with the file it reads.
@@ -398,11 +433,11 @@ func (f *FS) GetObject(ctx context.Context, bucket, object string, opts storage.
 		return nil, zero, err
 	}
 	defer unlock()
-	v, latest, keyDir, err := f.lookup(bucket, object, opts.VersionID)
+	v, latest, keyDir, state, err := f.lookup(bucket, object, opts.VersionID)
 	if err != nil {
 		return nil, zero, err
 	}
-	info := toInfo(bucket, object, v, latest)
+	info := toInfo(bucket, object, v, latest, state)
 	if rg := opts.Range; rg != nil {
 		if rg.Start < 0 || rg.Length <= 0 || rg.Start+rg.Length > v.Size {
 			return nil, zero, storage.Wrap(storage.ErrInvalidRange, bucket, object)
@@ -614,14 +649,23 @@ func (m *multiFile) Close() error {
 	return nil
 }
 
-// DeleteObject removes an object. Deleting a missing object succeeds, as
-// in S3. Versioned deletes are not implemented in Phase 1.
+// DeleteObject implements storage.StorageAPI.
+//
+//   - With opts.VersionID the one version, object or delete marker, is
+//     removed permanently; naming a version that is not there succeeds.
+//   - Without it, an Unversioned bucket loses the object; an Enabled bucket
+//     gets a delete marker with a new version ID (even for a key that has no
+//     versions, as S3 does); a Suspended bucket gets a null delete marker
+//     that replaces the null version.
+//
+// Deleting a missing object succeeds, as in S3.
 func (f *FS) DeleteObject(ctx context.Context, bucket, object string, opts storage.DeleteOptions) (storage.DeleteResult, error) {
 	if err := validate(bucket, object); err != nil {
 		return storage.DeleteResult{}, err
 	}
-	if opts.Versioned || opts.VersionID != "" {
-		return storage.DeleteResult{}, notImpl("versioned DeleteObject")
+	stored, err := storage.StoredVersionID(opts.VersionID)
+	if err != nil {
+		return storage.DeleteResult{}, storage.Wrap(err, bucket, object)
 	}
 	if err := f.enter(); err != nil {
 		return storage.DeleteResult{}, err
@@ -640,7 +684,10 @@ func (f *FS) DeleteObject(ctx context.Context, bucket, object string, opts stora
 	if err := f.requireBucket(bucket); err != nil {
 		return storage.DeleteResult{}, err
 	}
-	bucketDir, _ := f.path(bucket)
+	cfg, err := f.versioningOf(bucket)
+	if err != nil {
+		return storage.DeleteResult{}, err
+	}
 	keyDir, err := f.keyDir(bucket, object)
 	if err != nil {
 		return storage.DeleteResult{}, err
@@ -649,28 +696,116 @@ func (f *FS) DeleteObject(ctx context.Context, bucket, object string, opts stora
 	if err != nil {
 		return storage.DeleteResult{}, storage.Wrap(err, bucket, object)
 	}
-	if file == nil {
-		return storage.DeleteResult{}, nil
-	}
-	// Removing xl.meta is the commit point; data dirs go after.
-	if err := os.Remove(filepath.Join(keyDir, storage.MetaFileName)); err != nil && !errors.Is(err, iofs.ErrNotExist) {
-		return storage.DeleteResult{}, mapErr(err, bucket, object)
-	}
-	for _, v := range file.Versions {
-		if v.DataDir != "" {
-			if err := f.pins.Remove(filepath.Join(keyDir, v.DataDir)); err != nil {
-				f.log.Warn("fs: could not remove data dir", "bucket", bucket, "object", object, "err", err)
+	st := metaVersioning(cfg.State)
+	guard := objlock.Guard(time.Now(), opts.BypassGovernance)
+	switch {
+	case opts.VersionID != "":
+		res := storage.DeleteResult{VersionID: storage.ReportedVersionID(cfg.State, stored)}
+		if file == nil {
+			return res, nil
+		}
+		v := file.Find(stored)
+		if v == nil {
+			return res, nil
+		}
+		res.DeleteMarker = v.Type == meta.TypeDeleteMarker
+		dirs, err := file.ApplyRemove(stored, file.Generation()+1, guard)
+		if err != nil {
+			return storage.DeleteResult{}, objlock.Err(err, bucket, object)
+		}
+		return res, f.persist(bucket, object, keyDir, file, dirs)
+	case st == meta.Unversioned:
+		if file == nil {
+			return storage.DeleteResult{}, nil
+		}
+		// Only the null version can exist here.
+		if err := file.Protected(guard); err != nil {
+			return storage.DeleteResult{}, objlock.Err(err, bucket, object)
+		}
+		var dirs []string
+		for _, v := range file.Versions {
+			if v.DataDir != "" {
+				dirs = append(dirs, v.DataDir)
 			}
 		}
+		file.Versions = nil
+		return storage.DeleteResult{}, f.persist(bucket, object, keyDir, file, dirs)
+	default:
+		if file == nil {
+			file = &meta.File{Format: meta.FormatVersion}
+		}
+		id, err := meta.VersionIDFor(st)
+		if err != nil {
+			return storage.DeleteResult{}, err
+		}
+		dirs, err := file.ApplyMarker(id, file.Generation()+1, time.Now().UTC(), guard)
+		if err != nil {
+			return storage.DeleteResult{}, objlock.Err(err, bucket, object)
+		}
+		res := storage.DeleteResult{VersionID: storage.ReportedVersionID(cfg.State, id), DeleteMarker: true}
+		return res, f.persist(bucket, object, keyDir, file, dirs)
 	}
-	// Prune now-empty key dirs up to (not including) the bucket.
-	for d := keyDir; d != bucketDir; d = filepath.Dir(d) {
-		if os.Remove(d) != nil {
-			break
+}
+
+// persist makes file the key's xl.meta (or removes the key when no version
+// is left) and then deletes the data directories dirs, which the new state
+// no longer references. Writing or removing xl.meta is the commit point.
+// The caller holds the key lock.
+func (f *FS) persist(bucket, object, keyDir string, file *meta.File, dirs []string) error {
+	bucketDir, _ := f.path(bucket)
+	metaPath := filepath.Join(keyDir, storage.MetaFileName)
+	if len(file.Versions) == 0 {
+		if err := os.Remove(metaPath); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+			return mapErr(err, bucket, object)
+		}
+	} else {
+		enc, err := meta.Encode(file)
+		if err != nil {
+			return err
+		}
+		id, err := meta.NewVersionID()
+		if err != nil {
+			return err
+		}
+		staged := filepath.Join(f.tmp, "meta-"+id)
+		defer f.holdStage(staged)()
+		if err := fsutil.WriteFileSync(staged, enc, filePerm); err != nil {
+			os.Remove(staged)
+			return mapErr(err, bucket, object)
+		}
+		for attempt := 0; ; attempt++ {
+			err = fsutil.MkdirAllSync(bucketDir, keyDir, dirPerm)
+			if err == nil {
+				err = os.Rename(staged, metaPath)
+			}
+			if err == nil {
+				break
+			}
+			if fsutil.IsPruneRace(err) && attempt < 20 {
+				continue
+			}
+			os.Remove(staged)
+			return mapErr(err, bucket, object)
+		}
+		if err := fsutil.SyncDir(keyDir); err != nil {
+			return mapErr(err, bucket, object)
 		}
 	}
-	if err := fsutil.SyncDir(filepath.Dir(keyDir)); err != nil && !errors.Is(err, iofs.ErrNotExist) {
-		return storage.DeleteResult{}, mapErr(err, bucket, object)
+	for _, d := range dirs {
+		if err := f.pins.Remove(filepath.Join(keyDir, d)); err != nil {
+			f.log.Warn("fs: could not remove data dir", "bucket", bucket, "object", object, "err", err)
+		}
 	}
-	return storage.DeleteResult{}, nil
+	if len(file.Versions) == 0 {
+		// Prune now-empty key dirs up to (not including) the bucket.
+		for d := keyDir; d != bucketDir; d = filepath.Dir(d) {
+			if os.Remove(d) != nil {
+				break
+			}
+		}
+		if err := fsutil.SyncDir(filepath.Dir(keyDir)); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+			return mapErr(err, bucket, object)
+		}
+	}
+	return nil
 }

@@ -9,6 +9,7 @@ import (
 
 	"nanoio/internal/meta"
 	"nanoio/internal/storage"
+	"nanoio/internal/storage/internal/objlock"
 	"nanoio/internal/storage/xl/disk"
 )
 
@@ -101,34 +102,44 @@ type HealResult struct {
 	Skipped string
 }
 
-// shardsHealthy checks one drive's copy of an object against the agreed
-// version: its metadata matches and every part's shard file exists with the
-// right size. With deep it also re-reads every block and verifies its hash
-// and the checksum root recorded in xl.meta.
-func (x *XL) shardsHealthy(ctx context.Context, d *drive, st *objState, bucket, object string, deep bool) bool {
-	i := d.idx
-	m := st.metas[i]
-	if m.ver == nil || fingerprint(m.ver) != fingerprint(st.ver) {
+// versionHealthy checks one drive's copy of version v against the agreed
+// one: the drive's xl.meta lists it identically, and (for an object) every
+// part's shard file exists with the right size. With deep it also re-reads
+// every block and verifies its hash and the checksum root recorded in the
+// drive's own record.
+func (x *XL) versionHealthy(ctx context.Context, d *drive, st *objState, v *meta.Version, bucket, object string, deep bool) bool {
+	m := st.metas[d.idx]
+	if m.file == nil {
 		return false
 	}
-	e := st.ver.Erasure
-	parts := st.ver.Parts
+	mine := m.file.Find(v.VersionID)
+	if mine == nil || versionFingerprint(mine) != versionFingerprint(v) {
+		return false
+	}
+	if v.Type != meta.TypeObject {
+		return true
+	}
+	e := v.Erasure
+	if e == nil || mine.Erasure == nil {
+		return false
+	}
+	parts := v.Parts
 	if len(parts) == 0 {
-		parts = []meta.Part{{N: 1, Size: st.ver.Size}}
+		parts = []meta.Part{{N: 1, Size: v.Size}}
 	}
 	for _, p := range parts {
-		size, err := d.StatShard(ctx, bucket, object, st.ver.DataDir, p.N)
+		size, err := d.StatShard(ctx, bucket, object, v.DataDir, p.N)
 		if err != nil || size != disk.ShardFileSize(p.Size, e.BlockSize, x.k) {
 			return false
 		}
 		if !deep {
 			continue
 		}
-		root, err := d.VerifyShard(ctx, bucket, object, st.ver.DataDir, p.N, p.Size, e.BlockSize, x.k)
+		root, err := d.VerifyShard(ctx, bucket, object, v.DataDir, p.N, p.Size, e.BlockSize, x.k)
 		if err != nil {
 			return false
 		}
-		for _, c := range m.ver.Erasure.Checksums {
+		for _, c := range mine.Erasure.Checksums {
 			if c.Part == p.N && c.Hash != "" && c.Hash != root {
 				return false
 			}
@@ -137,14 +148,22 @@ func (x *XL) shardsHealthy(ctx context.Context, d *drive, st *objState, bucket, 
 	return true
 }
 
-// HealObject repairs one object: shards that are missing, outdated or
-// corrupt on any usable drive are reconstructed from the intact ones and
-// published, and shards that can never be read are removed. deep also
+// healVersion is the repair plan of one object version.
+type healVersion struct {
+	v    *meta.Version
+	good []int // drives holding an intact copy
+	need []int // ready drives that do not
+}
+
+// HealObject repairs one key: every version the agreed list names is
+// rebuilt on the drives that lack it or hold a damaged copy (from the intact
+// shards of that version), each drive's xl.meta is made to list exactly the
+// agreed versions, and shards that can never be read are removed. deep also
 // verifies every block's hash on every drive (bitrot scrub).
 //
 // Reconstruction runs under the shared lock, so readers are not blocked;
 // the exclusive lock is taken only for the commit, after re-checking that
-// the object has not been rewritten in the meantime.
+// the key's version list has not changed in the meantime.
 func (x *XL) HealObject(ctx context.Context, bucket, object string, deep bool) (HealResult, error) {
 	res := HealResult{Bucket: bucket, Object: object}
 	if err := validate(bucket, object); err != nil {
@@ -165,34 +184,40 @@ func (x *XL) HealObject(ctx context.Context, bucket, object string, deep bool) (
 		unlockR()
 		return x.healDangling(ctx, bucket, object, st)
 	}
-	var need, good []int
+	win := st.file
+	winFP := fileFingerprint(win)
+	var ready []int
 	for i, d := range x.drives {
-		if !d.Ready(ctx) {
-			continue
-		}
-		if x.shardsHealthy(ctx, d, st, bucket, object, deep) {
-			good = append(good, i)
-		} else {
-			need = append(need, i)
+		if d.Ready(ctx) {
+			ready = append(ready, i)
 		}
 	}
-	x.log.Debug("xl: heal diagnosis", "bucket", bucket, "object", object, "need", need, "good", good, "deep", deep)
-	if len(need) == 0 {
+	// A drive is done when it lists the agreed versions and every one of
+	// them is intact on it; otherwise it is republished.
+	plans := make([]healVersion, len(win.Versions))
+	republish := map[int]bool{}
+	for vi := range win.Versions {
+		v := &win.Versions[vi]
+		plans[vi].v = v
+		for _, i := range ready {
+			if x.versionHealthy(ctx, x.drives[i], st, v, bucket, object, deep) {
+				plans[vi].good = append(plans[vi].good, i)
+			} else {
+				plans[vi].need = append(plans[vi].need, i)
+				republish[i] = true
+			}
+		}
+	}
+	for _, i := range ready {
+		if st.metas[i].fp != winFP {
+			republish[i] = true // lists a different set of versions
+		}
+	}
+	x.log.Debug("xl: heal diagnosis", "bucket", bucket, "object", object, "republish", len(republish), "versions", len(plans), "deep", deep)
+	if len(republish) == 0 {
 		unlockR()
 		res.Skipped = "healthy"
 		return res, nil
-	}
-	if len(good) < x.k {
-		unlockR()
-		return res, storage.Wrap(fmt.Errorf("%w: %d intact copies, %d needed to rebuild",
-			storage.ErrCorrupted, len(good), x.k), bucket, object)
-	}
-	ver := *st.ver
-	e := ver.Erasure
-	dist := e.Distribution
-	if len(dist) != len(x.drives) {
-		unlockR()
-		return res, storage.Wrap(fmt.Errorf("%w: object has no valid distribution", storage.ErrCorrupted), bucket, object)
 	}
 	token, err := newToken()
 	if err != nil {
@@ -201,30 +226,56 @@ func (x *XL) HealObject(ctx context.Context, bucket, object string, deep bool) (
 	}
 	stageID := "heal-" + token
 	defer x.removeStages(ctx, stageID)
-	participants := make([]bool, len(x.drives))
-	for _, i := range need {
-		participants[i] = true // cleared by rebuildPart if the drive cannot take its shard
+	ok := make([]bool, len(x.drives)) // drives that will be republished
+	for i := range republish {
+		ok[i] = true
 	}
-	parts := ver.Parts
-	if len(parts) == 0 {
-		parts = []meta.Part{{N: 1, Size: ver.Size}}
+	// roots[drive][versionID][part]: checksums of the shards rebuilt here.
+	roots := make([]map[string]map[int]string, len(x.drives))
+	for i := range roots {
+		roots[i] = map[string]map[int]string{}
 	}
-	roots := make([]map[int]string, len(x.drives)) // drive -> part -> root
-	for _, i := range need {
-		roots[i] = map[int]string{}
-	}
-	for _, p := range parts {
-		if err := ctx.Err(); err != nil {
-			unlockR()
-			return res, err
+	rebuilt := make([][]string, len(x.drives)) // staged data dirs per drive
+	for _, pl := range plans {
+		v := pl.v
+		if v.Type != meta.TypeObject || len(pl.need) == 0 {
+			continue
 		}
-		got, err := x.rebuildPart(ctx, bucket, object, st, good, need, participants, stageID, p, e.BlockSize)
-		if err != nil {
+		e := v.Erasure
+		if e == nil || len(e.Distribution) != len(x.drives) {
 			unlockR()
-			return res, err
+			return res, storage.Wrap(fmt.Errorf("%w: version %q has no valid distribution", storage.ErrCorrupted, v.VersionID), bucket, object)
 		}
-		for i, root := range got {
-			roots[i][p.N] = root
+		if len(pl.good) < x.k {
+			unlockR()
+			return res, storage.Wrap(fmt.Errorf("%w: version %q has %d intact copies, %d needed to rebuild",
+				storage.ErrCorrupted, v.VersionID, len(pl.good), x.k), bucket, object)
+		}
+		parts := v.Parts
+		if len(parts) == 0 {
+			parts = []meta.Part{{N: 1, Size: v.Size}}
+		}
+		for _, i := range pl.need {
+			roots[i][v.VersionID] = map[int]string{}
+		}
+		for _, p := range parts {
+			if err := ctx.Err(); err != nil {
+				unlockR()
+				return res, err
+			}
+			got, err := x.rebuildPart(ctx, bucket, object, st, v, pl.good, pl.need, ok, stageID, p, e.BlockSize)
+			if err != nil {
+				unlockR()
+				return res, err
+			}
+			for i, root := range got {
+				roots[i][v.VersionID][p.N] = root
+			}
+		}
+		for _, i := range pl.need {
+			if ok[i] {
+				rebuilt[i] = append(rebuilt[i], v.DataDir)
+			}
 		}
 	}
 	unlockR()
@@ -241,43 +292,64 @@ func (x *XL) HealObject(ctx context.Context, bucket, object string, deep bool) (
 	}
 	defer unlockKey()
 	st2 := x.stateOfAll(ctx, bucket, object)
-	if !st2.found(x.k) || fingerprint(st2.ver) != fingerprint(st.ver) {
+	if !st2.found(x.k) || fileFingerprint(st2.file) != winFP {
 		res.Skipped = "changed"
 		return res, nil
 	}
-	x.log.Debug("xl: heal publishing", "bucket", bucket, "object", object, "need", need, "participants", participants)
-	sums := make([][]meta.Checksum, len(x.drives))
-	for _, i := range need {
-		if !participants[i] {
+	x.log.Debug("xl: heal publishing", "bucket", bucket, "object", object, "drives", ok)
+
+	files := make([]*meta.File, len(x.drives))
+	for i := range x.drives {
+		if !ok[i] {
 			continue
 		}
-		for _, p := range parts {
-			sums[i] = append(sums[i], meta.Checksum{Part: p.N, Algorithm: hashAlgorithm, Hash: roots[i][p.N]})
+		f := &meta.File{Format: meta.FormatVersion, Gen: win.Generation()}
+		for _, v := range win.Versions {
+			nv := v
+			if v.Erasure != nil {
+				e := *v.Erasure
+				e.Index = v.Erasure.Distribution[i]
+				e.Checksums = nil
+				if got, rebuiltHere := roots[i][v.VersionID]; rebuiltHere {
+					for _, p := range v.Parts {
+						e.Checksums = append(e.Checksums, meta.Checksum{Part: p.N, Algorithm: hashAlgorithm, Hash: got[p.N]})
+					}
+					if len(v.Parts) == 0 {
+						e.Checksums = append(e.Checksums, meta.Checksum{Part: 1, Algorithm: hashAlgorithm, Hash: got[1]})
+					}
+				} else if mine := st.metas[i].file; mine != nil {
+					if own := mine.Find(v.VersionID); own != nil && own.Erasure != nil {
+						e.Checksums = own.Erasure.Checksums
+					}
+				}
+				nv.Erasure = &e
+			}
+			f.Versions = append(f.Versions, nv)
 		}
+		files[i] = f
 	}
-	tmpl := ver
-	tmpl.Erasure = nil
-	spec := commitSpec{bucket: bucket, object: object, stageID: stageID, dataDir: ver.DataDir, tmpl: tmpl,
-		dist: dist, blockSize: e.BlockSize, sums: sums, participants: participants}
+	spec := commitSpec{bucket: bucket, object: object, op: disk.OpReplace, stageID: stageID,
+		participants: ok, files: files, dataDirs: rebuilt}
 	cres := x.commit(ctx, spec)
 	x.log.Debug("xl: heal committed", "bucket", bucket, "object", object, "committed", cres.committed, "errs", fmt.Sprint(cres.errs))
 	res.Healed = cres.committed
-	// A drive that held an older version keeps its superseded data
-	// directory until now; Finish drops it, as an ordinary overwrite would.
+	// A drive that held other versions keeps their data directories until
+	// now; Finish drops them, as an ordinary overwrite would.
 	x.finish(ctx, spec, cres)
 	for i, err := range cres.errs {
-		if err != nil && participants[i] && !errors.Is(err, errDriveOffline) {
+		if err != nil && ok[i] && !errors.Is(err, errDriveOffline) {
 			x.log.Warn("xl: heal commit failed", "bucket", bucket, "object", object, "drive", i, "err", err)
 		}
 	}
 	return res, nil
 }
 
-// rebuildPart reconstructs part p onto the need drives' staging files and
-// returns each drive's checksum root.
-func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objState, good, need []int,
-	participants []bool, stageID string, p meta.Part, blockSize int64) (map[int]string, error) {
-	e := st.ver.Erasure
+// rebuildPart reconstructs part p of version v onto the need drives'
+// staging files and returns each drive's checksum root. ok is cleared for a
+// drive that cannot take its shard.
+func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objState, v *meta.Version, good, need []int,
+	ok []bool, stageID string, p meta.Part, blockSize int64) (map[int]string, error) {
+	e := v.Erasure
 	n := x.k + x.m
 	// Open one source per good drive, keyed by the shard it holds.
 	type src struct {
@@ -291,11 +363,19 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 		}
 	}()
 	for _, i := range good {
-		f, err := x.drives[i].OpenShard(ctx, bucket, object, st.ver.DataDir, p.N)
+		mine := st.metas[i].file
+		if mine == nil {
+			continue
+		}
+		rec := mine.Find(v.VersionID)
+		if rec == nil || rec.Erasure == nil {
+			continue
+		}
+		f, err := x.drives[i].OpenShard(ctx, bucket, object, v.DataDir, p.N)
 		if err != nil {
 			continue
 		}
-		srcs = append(srcs, src{f: f, shard: st.metas[i].ver.Erasure.Index})
+		srcs = append(srcs, src{f: f, shard: rec.Erasure.Index})
 	}
 	if len(srcs) < x.k {
 		return nil, storage.Wrap(fmt.Errorf("%w: cannot open enough shards of part %d", storage.ErrCorrupted, p.N), bucket, object)
@@ -303,12 +383,12 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 	// Writers indexed by drive; the shard each takes is dist[drive].
 	writers := make(map[int]*shardWriter)
 	for _, i := range need {
-		if !participants[i] {
+		if !ok[i] {
 			continue
 		}
-		w, err := newShardWriter(ctx, x.drives[i], stageID, fmt.Sprintf("%s/part.%d", st.ver.DataDir, p.N), x.writeQueue)
+		w, err := newShardWriter(ctx, x.drives[i], stageID, fmt.Sprintf("%s/part.%d", v.DataDir, p.N), x.writeQueue)
 		if err != nil {
-			participants[i] = false
+			ok[i] = false
 			continue
 		}
 		writers[i] = w
@@ -316,7 +396,7 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 	abort := func() {
 		for i, w := range writers {
 			w.abort()
-			participants[i] = false
+			ok[i] = false
 		}
 	}
 	for b := int64(0); b < disk.BlockCount(p.Size, blockSize); b++ {
@@ -349,7 +429,7 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 		}
 		for i, w := range writers {
 			if !w.failed() {
-				w.enqueue(ctx, shards[e.Distribution[i]], false)
+				w.enqueue(ctx, shards[e.Distribution[i]], false, 0)
 			}
 		}
 	}
@@ -357,7 +437,7 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 	for i, w := range writers {
 		root, err := w.wait(ctx)
 		if err != nil {
-			participants[i] = false
+			ok[i] = false
 			continue
 		}
 		roots[i] = root
@@ -372,7 +452,7 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 // drives might hold the rest.
 func (x *XL) healDangling(ctx context.Context, bucket, object string, st *objState) (HealResult, error) {
 	res := HealResult{Bucket: bucket, Object: object}
-	if st.ver == nil && st.corrupt == 0 {
+	if st.file == nil && st.corrupt == 0 {
 		res.Skipped = "absent"
 		return res, nil
 	}
@@ -436,6 +516,24 @@ func (x *XL) healBucket(ctx context.Context, bucket string) ([]int, error) {
 		}
 		if made, err := d.MakeBucket(ctx, bucket, created); err == nil && made {
 			healed = append(healed, d.idx)
+		}
+	}
+	// Bring drives that missed a versioning change up to the agreed state.
+	if v, err := x.versioning(ctx, bucket); err == nil {
+		for _, i := range v.laggards {
+			d := x.drives[i]
+			if err := d.WriteBucketVersioning(ctx, bucket, string(v.cfg.State), v.cfg.Seq); err == nil {
+				healed = append(healed, i)
+			}
+		}
+		// And the object lock configuration, which is what keeps a drive
+		// that missed a change from putting an unprotected default on
+		// writes it later serves.
+		for _, i := range v.lockLaggards {
+			d := x.drives[i]
+			if err := d.WriteBucketObjectLock(ctx, bucket, objlock.Encode(v.lock.cfg), v.lock.seq); err == nil {
+				healed = append(healed, i)
+			}
 		}
 	}
 	return healed, nil

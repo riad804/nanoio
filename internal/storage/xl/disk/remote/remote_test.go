@@ -6,6 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -291,3 +294,113 @@ func readCloser(b []byte) *nopCloser { return &nopCloser{bytes.NewReader(b)} }
 type nopCloser struct{ *bytes.Reader }
 
 func (nopCloser) Close() error { return nil }
+
+func TestCircuitBreaker(t *testing.T) {
+	e := newEnv(t, "n1", "n2")
+	e.addDrive(t, "n2", "d0")
+	opt := fast
+	opt.DownFor = 150 * time.Millisecond
+	opt.BreakerThreshold = 2
+	opt.BreakerMax = time.Second
+	r := remote.New(e.client(t, "n1"), "n2", "d0", opt)
+	addr := "n2:9000"
+	if _, err := r.ListBuckets(bg); err != nil {
+		t.Fatal(err)
+	}
+	if r.Breaker() != "closed" {
+		t.Fatalf("breaker = %s", r.Breaker())
+	}
+
+	// A dead node is tried the threshold number of times, then not at all.
+	e.net.Crash(addr)
+	before := e.net.Attempts(addr)
+	var refused int
+	for i := 0; i < 8; i++ {
+		_, err := r.ListBuckets(bg)
+		if !errors.Is(err, disk.ErrOffline) {
+			t.Fatalf("call %d = %v, want ErrOffline", i, err)
+		}
+		if strings.Contains(err.Error(), "circuit breaker") {
+			refused++
+		}
+	}
+	if sent := e.net.Attempts(addr) - before; sent != 2 {
+		t.Errorf("%d requests reached the dead node, want exactly the threshold (2)", sent)
+	}
+	if refused != 6 {
+		t.Errorf("%d calls refused by the breaker, want 6", refused)
+	}
+	if r.Breaker() != "open" {
+		t.Errorf("breaker = %s, want open", r.Breaker())
+	}
+	if r.Ready(bg) {
+		t.Error("a drive behind an open breaker reports ready")
+	}
+
+	// A failed half-open probe re-opens it for longer.
+	time.Sleep(200 * time.Millisecond)
+	if r.Breaker() != "half-open" {
+		t.Fatalf("breaker = %s, want half-open", r.Breaker())
+	}
+	before = e.net.Attempts(addr)
+	r.ListBuckets(bg)
+	if sent := e.net.Attempts(addr) - before; sent != 1 {
+		t.Errorf("half-open let %d probes through", sent)
+	}
+	if r.Breaker() != "open" {
+		t.Errorf("breaker = %s after a failed probe", r.Breaker())
+	}
+
+	// Recovery: when the node is back, exactly one probe goes out while
+	// others are refused, and its success closes the breaker.
+	e.net.Restart(addr)
+	e.net.Delay("n1:9000", addr, 300*time.Millisecond)
+	time.Sleep(450 * time.Millisecond) // past the doubled interval
+	before = e.net.Attempts(addr)
+	var wg sync.WaitGroup
+	var okCalls atomic.Int32
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := r.ListBuckets(bg); err == nil {
+				okCalls.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if sent := e.net.Attempts(addr) - before; sent != 1 {
+		t.Errorf("%d concurrent calls reached the recovering node, want 1 probe", sent)
+	}
+	if okCalls.Load() != 1 {
+		t.Errorf("%d calls succeeded, want just the probe", okCalls.Load())
+	}
+	if r.Breaker() != "closed" {
+		t.Errorf("breaker = %s after a successful probe", r.Breaker())
+	}
+	e.net.Heal()
+	if _, err := r.ListBuckets(bg); err != nil {
+		t.Errorf("call after recovery: %v", err)
+	}
+}
+
+// A caller that gives up says nothing about the drive.
+func TestCallerCancellationDoesNotOpenTheBreaker(t *testing.T) {
+	e := newEnv(t, "n1", "n2")
+	e.addDrive(t, "n2", "d0")
+	opt := fast
+	opt.BreakerThreshold = 1
+	r := remote.New(e.client(t, "n1"), "n2", "d0", opt)
+	e.net.Delay("n1:9000", "n2:9000", 500*time.Millisecond)
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(bg, 30*time.Millisecond)
+		_, err := r.ListBuckets(ctx)
+		cancel()
+		if !errors.Is(err, disk.ErrCanceled) {
+			t.Fatalf("err = %v, want a cancellation", err)
+		}
+	}
+	if r.Breaker() != "closed" {
+		t.Errorf("breaker = %s after only caller-side cancellations", r.Breaker())
+	}
+}

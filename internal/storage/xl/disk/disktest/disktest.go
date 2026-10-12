@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"nanoio/internal/meta"
+	"nanoio/internal/storage"
 	"nanoio/internal/storage/xl/disk"
 )
 
@@ -138,6 +139,11 @@ func Run(t *testing.T, newDisk Factory) {
 		{"Concurrency", plain(testConcurrency)},
 		{"ConditionalCommit", plain(testCAS)},
 		{"TypedErrors", plain(testTypedErrors)},
+		{"BucketVersioning", plain(testBucketVersioning)},
+		{"VersionOps", plain(testVersionOps)},
+		{"VersionReplace", plain(testVersionReplace)},
+		{"BucketSettings", plain(testBucketSettings)},
+		{"ObjectLock", plain(testObjectLock)},
 		{"OfflineAfterClose", testClosed},
 	}
 	for _, c := range cases {
@@ -762,8 +768,12 @@ func commitGen(t *testing.T, d disk.Disk, obj, dataDir, stage string, gen, prev 
 	writeStage(t, d, stage, dataDir+"/part.1", frame(40))
 	v := version(dataDir, 40, "etag-"+dataDir)
 	v.Generation = gen
-	return d.CommitObject(bg, disk.CommitRequest{Bucket: "b", Object: obj, StageID: stage, DataDir: dataDir,
-		Version: v, CheckGen: check, PrevGen: prev})
+	req := disk.CommitRequest{Bucket: "b", Object: obj, StageID: stage, DataDir: dataDir,
+		Version: v, CheckGen: check, PrevGen: prev}
+	if check { // a numbered write; an unconditional one lets the drive number it
+		req.Seq = gen
+	}
+	return d.CommitObject(bg, req)
 }
 
 func testCAS(t *testing.T, d disk.Disk) {
@@ -886,4 +896,472 @@ func testTypedErrors(t *testing.T, d disk.Disk) {
 		t.Errorf("lost CAS: kind %v err %v", k, err)
 	}
 	d.RemoveStage(bg, "ts2")
+}
+
+func testBucketVersioning(t *testing.T, d disk.Disk) {
+	created := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	if _, err := d.MakeBucket(bg, "vb", created); err != nil {
+		t.Fatal(err)
+	}
+	st, seq, err := d.ReadBucketVersioning(bg, "vb")
+	if err != nil || st != "" || seq != 0 {
+		t.Fatalf("fresh bucket = %q, %d, %v", st, seq, err)
+	}
+	if err := d.WriteBucketVersioning(bg, "vb", "Enabled", 1); err != nil {
+		t.Fatal(err)
+	}
+	if st, seq, err = d.ReadBucketVersioning(bg, "vb"); err != nil || st != "Enabled" || seq != 1 {
+		t.Fatalf("after write = %q, %d, %v", st, seq, err)
+	}
+	// The creation record survives, and so does the state across other
+	// bucket and object activity.
+	if exists, got, err := d.StatBucket(bg, "vb"); err != nil || !exists || !got.Equal(created) {
+		t.Errorf("StatBucket = %v %v %v; want created %v", exists, got, err, created)
+	}
+	c, _ := put(t, d, "vb", "obj", ".nanoio-data-v1", "vs1", 50)
+	c.Finish(bg)
+	if st, seq, _ = d.ReadBucketVersioning(bg, "vb"); st != "Enabled" || seq != 1 {
+		t.Errorf("state changed by an object write: %q, %d", st, seq)
+	}
+	if err := d.WriteBucketVersioning(bg, "vb", "Suspended", 2); err != nil {
+		t.Fatal(err)
+	}
+	if st, seq, _ = d.ReadBucketVersioning(bg, "vb"); st != "Suspended" || seq != 2 {
+		t.Errorf("after second write = %q, %d", st, seq)
+	}
+	// The drive stores what it is told; ordering and repair are the
+	// caller's job (xl writes every drive and heals laggards).
+	if err := d.WriteBucketVersioning(bg, "vb", "Suspended", 2); err != nil {
+		t.Errorf("rewriting the same value = %v", err)
+	}
+	if err := d.WriteBucketVersioning(bg, "vb", "Enabled", 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, seq, _ = d.ReadBucketVersioning(bg, "vb"); seq != 7 {
+		t.Errorf("seq = %d", seq)
+	}
+	if _, _, err := d.ReadBucketVersioning(bg, "missing"); !errors.Is(err, disk.ErrNotFound) {
+		t.Errorf("read of a missing bucket = %v", err)
+	}
+	if err := d.WriteBucketVersioning(bg, "missing", "Enabled", 1); !errors.Is(err, disk.ErrNotFound) {
+		t.Errorf("write to a missing bucket = %v", err)
+	}
+	// A deleted and re-created bucket starts unversioned again.
+	d.DeleteBucket(bg, "vb")
+	d.MakeBucket(bg, "vb", created)
+	if st, seq, _ = d.ReadBucketVersioning(bg, "vb"); st != "" || seq != 0 {
+		t.Errorf("recreated bucket = %q, %d", st, seq)
+	}
+}
+
+// putVer stages and commits one numbered version of obj.
+func putVer(t *testing.T, d disk.Disk, obj, id, dataDir string, seq uint64) disk.Commit {
+	t.Helper()
+	stage := "pv-" + dataDir
+	writeStage(t, d, stage, dataDir+"/part.1", frame(30))
+	v := version(dataDir, 30, "etag-"+dataDir)
+	v.VersionID = id
+	c, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: obj, Op: disk.OpPut,
+		StageID: stage, DataDir: dataDir, Version: v, Seq: seq, CheckGen: true, PrevGen: seq - 1})
+	if err != nil {
+		t.Fatalf("OpPut %s@%q seq %d: %v", obj, id, seq, err)
+	}
+	t.Cleanup(func() { d.RemoveStage(bg, stage) })
+	return c
+}
+
+func fileOf(t *testing.T, d disk.Disk, obj string) *meta.File {
+	t.Helper()
+	raw, err := d.ReadMeta(bg, "vb", obj)
+	if err != nil {
+		t.Fatalf("ReadMeta(%s): %v", obj, err)
+	}
+	f, err := meta.Decode(raw)
+	if err != nil {
+		t.Fatalf("xl.meta of %s does not decode: %v", obj, err)
+	}
+	return f
+}
+
+func hasData(d disk.Disk, obj, dataDir string) bool {
+	_, err := d.StatShard(bg, "vb", obj, dataDir, 1)
+	return err == nil
+}
+
+func versionIDs(f *meta.File) []string {
+	var out []string
+	for _, v := range f.Versions {
+		out = append(out, v.VersionID)
+	}
+	return out
+}
+
+func testVersionOps(t *testing.T, d disk.Disk) {
+	d.MakeBucket(bg, "vb", time.Now())
+	same := func(got, want []string, what string) {
+		t.Helper()
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s = %v, want %v", what, got, want)
+		}
+	}
+
+	// Versions accumulate, newest first, each with its own data.
+	putVer(t, d, "k", "ida", ".nanoio-data-a", 1).Finish(bg)
+	putVer(t, d, "k", "idb", ".nanoio-data-b", 2).Finish(bg)
+	f := fileOf(t, d, "k")
+	same(versionIDs(f), []string{"idb", "ida"}, "versions")
+	if f.Gen != 2 || f.Versions[0].Seq != 2 || f.Versions[1].Seq != 1 {
+		t.Errorf("gen %d seqs %d,%d", f.Gen, f.Versions[0].Seq, f.Versions[1].Seq)
+	}
+	if !hasData(d, "k", ".nanoio-data-a") || !hasData(d, "k", ".nanoio-data-b") {
+		t.Error("a version's data is missing")
+	}
+
+	// The null version is replaced; its data goes at Finish, not before.
+	putVer(t, d, "k", "", ".nanoio-data-n1", 3).Finish(bg)
+	c := putVer(t, d, "k", "", ".nanoio-data-n2", 4)
+	same(versionIDs(fileOf(t, d, "k")), []string{"", "idb", "ida"}, "versions with the null version")
+	if !hasData(d, "k", ".nanoio-data-n1") {
+		t.Error("a replaced null version's data was removed before Finish")
+	}
+	c.Finish(bg)
+	if hasData(d, "k", ".nanoio-data-n1") {
+		t.Error("a replaced null version's data survived Finish")
+	}
+
+	// A delete marker, then removing it.
+	mv := meta.Version{Type: meta.TypeDeleteMarker, VersionID: "m1", ModTime: time.Now().UTC()}
+	mc, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "k", Op: disk.OpMarker, Version: mv,
+		Seq: 5, CheckGen: true, PrevGen: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mc.Finish(bg)
+	f = fileOf(t, d, "k")
+	if f.Latest().Type != meta.TypeDeleteMarker || f.Latest().VersionID != "m1" || f.Gen != 5 {
+		t.Errorf("latest = %+v gen %d", f.Latest(), f.Gen)
+	}
+	rm := func(id string, seq uint64) (disk.Commit, error) {
+		return d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "k", Op: disk.OpRemove,
+			VersionID: id, Seq: seq, CheckGen: true, PrevGen: seq - 1})
+	}
+	c, err = rm("m1", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Finish(bg)
+	same(versionIDs(fileOf(t, d, "k")), []string{"", "idb", "ida"}, "after removing the marker")
+
+	// Removal: data stays until Finish, and a rollback restores everything.
+	c, err = rm("ida", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same(versionIDs(fileOf(t, d, "k")), []string{"", "idb"}, "after OpRemove")
+	if !hasData(d, "k", ".nanoio-data-a") {
+		t.Error("a removed version's data went before Finish")
+	}
+	if err := c.Rollback(bg); err != nil {
+		t.Fatal(err)
+	}
+	f = fileOf(t, d, "k")
+	same(versionIDs(f), []string{"", "idb", "ida"}, "after rolling the removal back")
+	if f.Gen != 6 || !hasData(d, "k", ".nanoio-data-a") {
+		t.Errorf("rollback left gen %d, data %v", f.Gen, hasData(d, "k", ".nanoio-data-a"))
+	}
+	c, err = rm("ida", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Finish(bg)
+	if hasData(d, "k", ".nanoio-data-a") {
+		t.Error("a removed version's data survived Finish")
+	}
+	// Removing a version this drive never had still advances its generation.
+	c, err = rm("never-had", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Finish(bg)
+	if f = fileOf(t, d, "k"); f.Gen != 8 || len(f.Versions) != 2 {
+		t.Errorf("after removing an unknown version: gen %d, %d versions", f.Gen, len(f.Versions))
+	}
+
+	// Conditional commits.
+	_, err = d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "k", Op: disk.OpRemove, VersionID: "idb",
+		Seq: 6, CheckGen: true, PrevGen: 5})
+	if !errors.Is(err, disk.ErrConflict) {
+		t.Errorf("removal based on an old generation = %v, want ErrConflict", err)
+	}
+	// A drive that is behind accepts a newer write.
+	c, err = d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "k", Op: disk.OpMarker,
+		Version: meta.Version{Type: meta.TypeDeleteMarker, VersionID: "m2", ModTime: time.Now().UTC()},
+		Seq:     20, CheckGen: true, PrevGen: 19})
+	if err != nil {
+		t.Fatalf("catching up: %v", err)
+	}
+	c.Finish(bg)
+	if f = fileOf(t, d, "k"); f.Gen != 20 {
+		t.Errorf("gen = %d", f.Gen)
+	}
+
+	// Removing the last version removes the key.
+	for i, id := range []string{"m2", "idb", ""} {
+		seq := uint64(21 + i)
+		c, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "k", Op: disk.OpRemove,
+			VersionID: id, Seq: seq, CheckGen: true, PrevGen: seq - 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Finish(bg)
+	}
+	if _, err := d.ReadMeta(bg, "vb", "k"); !errors.Is(err, disk.ErrNotFound) {
+		t.Errorf("xl.meta of a key with no versions: %v", err)
+	}
+	if keys, _ := d.ListKeys(bg, "vb", ""); len(keys) != 0 {
+		t.Errorf("keys = %v", keys)
+	}
+	// Removing from a key that has nothing is a no-op.
+	c, err = d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "k", Op: disk.OpRemove,
+		VersionID: "idb", Seq: 30})
+	if err != nil {
+		t.Fatalf("remove from an absent key: %v", err)
+	}
+	c.Finish(bg)
+	c.Rollback(bg)
+}
+
+func testVersionReplace(t *testing.T, d disk.Disk) {
+	d.MakeBucket(bg, "vb", time.Now())
+	putVer(t, d, "r", "x1", ".nanoio-data-x1", 1).Finish(bg)
+	putVer(t, d, "r", "x2", ".nanoio-data-x2", 2).Finish(bg)
+
+	// Repair: the file becomes {x2 (kept), x3 (staged data)}; x1 is not in
+	// it, so its data goes at Finish.
+	writeStage(t, d, "repair", ".nanoio-data-x3/part.1", frame(30))
+	cur := fileOf(t, d, "r")
+	x3 := version(".nanoio-data-x3", 30, "etag-x3")
+	x3.VersionID, x3.Seq = "x3", 3
+	next := &meta.File{Format: meta.FormatVersion, Gen: 3, Versions: []meta.Version{x3, *cur.Find("x2")}}
+	c, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "r", Op: disk.OpReplace,
+		StageID: "repair", DataDirs: []string{".nanoio-data-x3"}, File: next})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasData(d, "r", ".nanoio-data-x1") {
+		t.Error("data of a dropped version went before Finish")
+	}
+	c.Finish(bg)
+	f := fileOf(t, d, "r")
+	if strings.Join(versionIDs(f), ",") != "x3,x2" || f.Gen != 3 {
+		t.Errorf("after replace: %v gen %d", versionIDs(f), f.Gen)
+	}
+	if hasData(d, "r", ".nanoio-data-x1") {
+		t.Error("data of a dropped version survived Finish")
+	}
+	if !hasData(d, "r", ".nanoio-data-x3") || !hasData(d, "r", ".nanoio-data-x2") {
+		t.Error("data of a kept version is missing")
+	}
+	d.RemoveStage(bg, "repair")
+
+	// A replace can be rolled back whole.
+	writeStage(t, d, "repair2", ".nanoio-data-y1/part.1", frame(30))
+	y1 := version(".nanoio-data-y1", 30, "etag-y1")
+	y1.VersionID, y1.Seq = "y1", 9
+	c, err = d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "r", Op: disk.OpReplace,
+		StageID: "repair2", DataDirs: []string{".nanoio-data-y1"},
+		File: &meta.File{Format: meta.FormatVersion, Gen: 9, Versions: []meta.Version{y1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Rollback(bg); err != nil {
+		t.Fatal(err)
+	}
+	f = fileOf(t, d, "r")
+	if strings.Join(versionIDs(f), ",") != "x3,x2" || f.Gen != 3 {
+		t.Errorf("after rolling a replace back: %v gen %d", versionIDs(f), f.Gen)
+	}
+	if hasData(d, "r", ".nanoio-data-y1") || !hasData(d, "r", ".nanoio-data-x2") {
+		t.Error("rollback left the wrong data directories")
+	}
+	d.RemoveStage(bg, "repair2")
+}
+
+func testBucketSettings(t *testing.T, d disk.Disk) {
+	if _, err := d.ReadBucketSettings(bg, "missing"); !errors.Is(err, disk.ErrNotFound) {
+		t.Errorf("ReadBucketSettings(missing) = %v, want ErrNotFound", err)
+	}
+	if err := d.WriteBucketObjectLock(bg, "missing", `{"enabled":true}`, 1); !errors.Is(err, disk.ErrNotFound) {
+		t.Errorf("WriteBucketObjectLock(missing) = %v, want ErrNotFound", err)
+	}
+	if _, err := d.MakeBucket(bg, "bs", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := d.ReadBucketSettings(bg, "bs"); err != nil || got != (disk.BucketSettings{}) {
+		t.Fatalf("fresh settings = %+v, %v", got, err)
+	}
+	if err := d.WriteBucketVersioning(bg, "bs", "Enabled", 1); err != nil {
+		t.Fatal(err)
+	}
+	doc := `{"enabled":true,"default":{"mode":"GOVERNANCE","days":3}}`
+	if err := d.WriteBucketObjectLock(bg, "bs", doc, 4); err != nil {
+		t.Fatal(err)
+	}
+	want := disk.BucketSettings{Versioning: "Enabled", VersioningSeq: 1, ObjectLock: doc, ObjectLockSeq: 4}
+	if got, err := d.ReadBucketSettings(bg, "bs"); err != nil || got != want {
+		t.Fatalf("settings = %+v, %v; want %+v", got, err, want)
+	}
+	// Each write keeps the other document.
+	if err := d.WriteBucketVersioning(bg, "bs", "Suspended", 2); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d.ReadBucketSettings(bg, "bs"); got.ObjectLock != doc || got.ObjectLockSeq != 4 || got.Versioning != "Suspended" {
+		t.Errorf("a versioning write disturbed the lock document: %+v", got)
+	}
+	if err := d.WriteBucketObjectLock(bg, "bs", doc, 5); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d.ReadBucketSettings(bg, "bs"); got.Versioning != "Suspended" || got.VersioningSeq != 2 || got.ObjectLockSeq != 5 {
+		t.Errorf("a lock write disturbed the versioning state: %+v", got)
+	}
+	// The creation time survives both.
+	if _, created, _ := d.StatBucket(bg, "bs"); created.IsZero() {
+		t.Error("creation time lost")
+	}
+}
+
+// testObjectLock pins that a drive refuses, whatever the caller asks, to
+// remove or replace a version object lock protects: this is the second line
+// of defence behind the coordinator's own check.
+func testObjectLock(t *testing.T, d disk.Disk) {
+	if _, err := d.MakeBucket(bg, "vb", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	hour := now.Add(time.Hour)
+	putLocked := func(obj, id, dataDir string, seq uint64, l *meta.Lock) {
+		t.Helper()
+		stage := "lk-" + dataDir
+		writeStage(t, d, stage, dataDir+"/part.1", frame(30))
+		v := version(dataDir, 30, "etag-"+dataDir)
+		v.VersionID, v.Lock = id, l
+		c, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: obj, Op: disk.OpPut,
+			StageID: stage, DataDir: dataDir, Version: v, Seq: seq, CheckGen: true, PrevGen: seq - 1})
+		if err != nil {
+			t.Fatalf("OpPut %s@%q: %v", obj, id, err)
+		}
+		c.Finish(bg)
+		t.Cleanup(func() { d.RemoveStage(bg, stage) })
+	}
+	remove := func(obj, id string, seq uint64, g meta.Guard) error {
+		_, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: obj, Op: disk.OpRemove,
+			VersionID: id, Seq: seq, CheckGen: true, PrevGen: seq - 1, Guard: g})
+		return err
+	}
+	setLock := func(obj, id string, seq uint64, l *meta.Lock, g meta.Guard) error {
+		t.Helper()
+		c, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: obj, Op: disk.OpSetLock,
+			VersionID: id, Lock: l, Seq: seq, CheckGen: true, PrevGen: seq - 1, Guard: g})
+		if err == nil {
+			c.Finish(bg)
+		}
+		return err
+	}
+	locked := func(err error) bool {
+		return errors.Is(err, disk.ErrLocked) && errors.Is(err, storage.ErrObjectLocked)
+	}
+
+	// COMPLIANCE: removal refused, bypass or not, and nothing changes.
+	putLocked("c", "ida", ".nanoio-data-c1", 1, &meta.Lock{Mode: meta.ModeCompliance, RetainUntil: hour})
+	for _, g := range []meta.Guard{{}, {Now: now}, {Now: now, BypassGovernance: true}} {
+		if err := remove("c", "ida", 2, g); !locked(err) {
+			t.Fatalf("OpRemove of a COMPLIANCE version with guard %+v = %v, want ErrLocked", g, err)
+		}
+	}
+	if f := fileOf(t, d, "c"); f.Gen != 1 || len(f.Versions) != 1 || !hasData(d, "c", ".nanoio-data-c1") {
+		t.Errorf("a refused removal changed the drive: gen %d, %d versions", f.Gen, len(f.Versions))
+	}
+	// Whole-key removal is refused as well.
+	if err := d.DeleteObject(bg, "vb", "c"); !locked(err) {
+		t.Errorf("DeleteObject of a key with a protected version = %v, want ErrLocked", err)
+	}
+	if !hasData(d, "c", ".nanoio-data-c1") {
+		t.Error("DeleteObject removed the data of a protected version")
+	}
+	// Shortening, removing and downgrading the retention is refused;
+	// extending is not.
+	for name, l := range map[string]*meta.Lock{
+		"shorten":   {Mode: meta.ModeCompliance, RetainUntil: now.Add(time.Minute)},
+		"remove":    nil,
+		"downgrade": {Mode: meta.ModeGovernance, RetainUntil: hour.Add(time.Hour)},
+	} {
+		if err := setLock("c", "ida", 2, l, meta.Guard{Now: now, BypassGovernance: true}); !locked(err) {
+			t.Errorf("OpSetLock %s = %v, want ErrLocked", name, err)
+		}
+	}
+	if err := setLock("c", "ida", 2, &meta.Lock{Mode: meta.ModeCompliance, RetainUntil: hour.Add(time.Hour), LegalHold: true},
+		meta.Guard{Now: now}); err != nil {
+		t.Fatalf("extending: %v", err)
+	}
+	if f := fileOf(t, d, "c"); f.Gen != 2 || f.Versions[0].Lock == nil || !f.Versions[0].Lock.LegalHold ||
+		!f.Versions[0].Lock.RetainUntil.Equal(hour.Add(time.Hour)) {
+		t.Errorf("lock after extending: %+v (gen %d)", f.Versions[0].Lock, f.Gen)
+	}
+	// Expired by the caller's clock, the hold is what still protects it.
+	late := meta.Guard{Now: hour.Add(3 * time.Hour)}
+	if err := remove("c", "ida", 3, late); !locked(err) {
+		t.Errorf("removal under a legal hold = %v, want ErrLocked", err)
+	}
+	if err := setLock("c", "ida", 3, &meta.Lock{Mode: meta.ModeCompliance, RetainUntil: hour.Add(time.Hour)}, late); err != nil {
+		t.Fatalf("lifting the hold: %v", err)
+	}
+	if err := remove("c", "ida", 4, late); err != nil {
+		t.Errorf("removal after expiry and hold lifted: %v", err)
+	}
+
+	// GOVERNANCE: bypass is the only way.
+	putLocked("g", "idg", ".nanoio-data-g1", 1, &meta.Lock{Mode: meta.ModeGovernance, RetainUntil: hour})
+	if err := remove("g", "idg", 2, meta.Guard{Now: now}); !locked(err) {
+		t.Errorf("OpRemove of a GOVERNANCE version = %v, want ErrLocked", err)
+	}
+	if err := remove("g", "idg", 2, meta.Guard{Now: now, BypassGovernance: true}); err != nil {
+		t.Errorf("OpRemove with bypass: %v", err)
+	}
+
+	// The null version of a locked object is not replaced by a write or a
+	// delete marker.
+	putLocked("n", "", ".nanoio-data-n1", 1, &meta.Lock{Mode: meta.ModeCompliance, RetainUntil: hour})
+	stage := "lk-n2"
+	writeStage(t, d, stage, ".nanoio-data-n2/part.1", frame(30))
+	t.Cleanup(func() { d.RemoveStage(bg, stage) })
+	v := version(".nanoio-data-n2", 30, "etag-n2")
+	_, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "n", Op: disk.OpPut, StageID: stage,
+		DataDir: ".nanoio-data-n2", Version: v, Seq: 2, CheckGen: true, PrevGen: 1, Guard: meta.Guard{Now: now, BypassGovernance: true}})
+	if !locked(err) {
+		t.Errorf("OpPut over a locked null version = %v, want ErrLocked", err)
+	}
+	_, err = d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "n", Op: disk.OpMarker,
+		Version: meta.Version{Type: meta.TypeDeleteMarker, ModTime: now}, Seq: 2, CheckGen: true, PrevGen: 1,
+		Guard: meta.Guard{Now: now}})
+	if !locked(err) {
+		t.Errorf("null OpMarker over a locked null version = %v, want ErrLocked", err)
+	}
+	// A marker with a new ID stacks on top and is fine.
+	c, err := d.CommitObject(bg, disk.CommitRequest{Bucket: "vb", Object: "n", Op: disk.OpMarker,
+		Version: meta.Version{Type: meta.TypeDeleteMarker, VersionID: "m1", ModTime: now}, Seq: 2, CheckGen: true, PrevGen: 1,
+		Guard: meta.Guard{Now: now}})
+	if err != nil {
+		t.Fatalf("stacking a marker: %v", err)
+	}
+	c.Finish(bg)
+	// Markers carry no lock and cannot be given one.
+	if err := setLock("n", "m1", 3, &meta.Lock{LegalHold: true}, meta.Guard{Now: now}); err == nil {
+		t.Error("OpSetLock on a delete marker succeeded")
+	}
+	if err := setLock("n", "no-such", 3, &meta.Lock{LegalHold: true}, meta.Guard{Now: now}); !errors.Is(err, disk.ErrNotFound) {
+		t.Errorf("OpSetLock of a missing version = %v, want ErrNotFound", err)
+	}
+	if err := setLock("no-such-key", "", 1, &meta.Lock{LegalHold: true}, meta.Guard{Now: now}); !errors.Is(err, disk.ErrNotFound) {
+		t.Errorf("OpSetLock of a missing key = %v, want ErrNotFound", err)
+	}
 }

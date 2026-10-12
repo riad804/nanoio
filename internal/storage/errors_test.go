@@ -22,8 +22,8 @@ func TestAllErrorsUniqueAndNonNil(t *testing.T) {
 		seen[err] = true
 		seenMsg[err.Error()] = true
 	}
-	if got := len(AllErrors()); got != 24 {
-		t.Errorf("AllErrors has %d entries, want 24 (update the table in api/ too)", got)
+	if got := len(AllErrors()); got != 30 {
+		t.Errorf("AllErrors has %d entries, want 30 (update the table in api/ too)", got)
 	}
 }
 

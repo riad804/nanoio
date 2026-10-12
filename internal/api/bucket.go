@@ -29,6 +29,9 @@ func (s *Server) listBuckets(q *request) {
 	res := listAllMyBucketsResult{Owner: placeholderOwner}
 	res.Buckets.Bucket = make([]bucketEntry, 0, len(list))
 	for _, b := range list {
+		if b.Name == sysBucket {
+			continue
+		}
 		res.Buckets.Bucket = append(res.Buckets.Bucket, bucketEntry{Name: b.Name, CreationDate: isoTime(b.Created)})
 	}
 	s.writeXML(q, http.StatusOK, &res)
@@ -52,10 +55,26 @@ func (s *Server) createBucket(q *request) {
 		// The location constraint is accepted and ignored: this server has
 		// a single region and clients routinely send their own.
 	}
-	if err := s.st.MakeBucket(q.r.Context(), q.bucket, storage.MakeBucketOptions{}); err != nil {
+	lock, aerr := createBucketLockRequested(q.r.Header)
+	if aerr != nil {
+		s.fail(q, aerr)
+		return
+	}
+	if lock {
+		// S3 asks for these on top of s3:CreateBucket: the bucket is born
+		// versioned and locked.
+		if !s.authorize(q, "s3:PutBucketObjectLockConfiguration", q.bucket, "", nil) ||
+			!s.authorize(q, "s3:PutBucketVersioning", q.bucket, "", nil) {
+			return
+		}
+	}
+	if err := s.st.MakeBucket(q.r.Context(), q.bucket, storage.MakeBucketOptions{ObjectLock: lock}); err != nil {
 		s.fail(q, err)
 		return
 	}
+	// A configuration left by an earlier bucket of this name (a crash
+	// between its deletion and the removal of its settings) must not apply.
+	s.dropEncConfig(q.r.Context(), q.bucket)
 	q.w.Header().Set("Location", "/"+q.bucket)
 	q.w.WriteHeader(http.StatusOK)
 }
@@ -84,6 +103,7 @@ func (s *Server) deleteBucket(q *request) {
 		s.fail(q, err)
 		return
 	}
+	s.dropEncConfig(q.r.Context(), q.bucket)
 	q.w.WriteHeader(http.StatusNoContent)
 }
 
@@ -149,7 +169,7 @@ func (p listParams) contents(objs []storage.ObjectInfo, owner bool) []contentsEn
 	for _, o := range objs {
 		e := contentsEntry{
 			Key: p.enc(o.Name), LastModified: isoTime(o.ModTime),
-			ETag: `"` + o.ETag + `"`, Size: o.Size, StorageClass: "STANDARD",
+			ETag: `"` + o.ETag + `"`, Size: plainSize(o), StorageClass: "STANDARD",
 		}
 		if owner {
 			ow := placeholderOwner
@@ -326,8 +346,14 @@ func (s *Server) deleteObjects(q *request) {
 	// only revealed to a caller allowed to delete at least one key.
 	allowed := make([]bool, len(req.Objects))
 	anyAllowed := false
+	asked := wantsBypass(q.r.Header)
 	for i, o := range req.Objects {
 		allowed[i] = s.mayDelete(q, o)
+		// Bypass asked for a key the caller may not bypass is that key's
+		// AccessDenied, not a silent downgrade.
+		if asked && allowed[i] {
+			allowed[i] = s.allowed(q, "s3:BypassGovernanceRetention", q.bucket, o.Key)
+		}
 		anyAllowed = anyAllowed || allowed[i]
 	}
 	if anyAllowed && !s.requireBucket(q) {
@@ -342,12 +368,9 @@ func (s *Server) deleteObjects(q *request) {
 			res.Errors = append(res.Errors, deleteError{Key: o.Key, Code: "AccessDenied", Message: "Access Denied."})
 			continue
 		}
-		if o.VersionID != "" {
-			res.Errors = append(res.Errors, deleteError{Key: o.Key, Code: "NotImplemented",
-				Message: "Deleting a specific version is not implemented."})
-			continue
-		}
-		if _, err := s.st.DeleteObject(q.r.Context(), q.bucket, o.Key, storage.DeleteOptions{}); err != nil {
+		dr, err := s.st.DeleteObject(q.r.Context(), q.bucket, o.Key, storage.DeleteOptions{VersionID: o.VersionID, BypassGovernance: asked})
+		if err != nil {
+			s.logLockRefusal(q, "delete", err)
 			ae, _, known := classify(err)
 			if !known {
 				s.log.Error("multi-delete failed", "id", q.id, "bucket", q.bucket, "key", o.Key, "err", err)
@@ -356,7 +379,17 @@ func (s *Server) deleteObjects(q *request) {
 			continue
 		}
 		if !req.Quiet {
-			res.Deleted = append(res.Deleted, deletedEntry{Key: o.Key})
+			e := deletedEntry{Key: o.Key}
+			switch {
+			case o.VersionID != "": // a version was removed
+				e.VersionID = o.VersionID
+				if dr.DeleteMarker {
+					e.DeleteMarker, e.DeleteMarkerVersionID = true, o.VersionID
+				}
+			case dr.DeleteMarker: // a marker was created
+				e.DeleteMarker, e.DeleteMarkerVersionID = true, dr.VersionID
+			}
+			res.Deleted = append(res.Deleted, e)
 		}
 	}
 	s.writeXML(q, http.StatusOK, &res)
@@ -407,4 +440,82 @@ func markIncomplete(q *request, out storage.ListResult) {
 	if out.Incomplete {
 		q.w.Header().Set("x-nanoio-list-incomplete", "true")
 	}
+}
+
+// authorizeListVersions checks s3:ListBucketVersions with the same
+// condition keys as a listing.
+func (s *Server) authorizeListVersions(q *request) bool {
+	ctx := map[string]string{}
+	for qp, key := range map[string]string{"prefix": "s3:prefix", "delimiter": "s3:delimiter", "max-keys": "s3:max-keys"} {
+		if q.has(qp) {
+			ctx[key] = q.query.Get(qp)
+		}
+	}
+	return s.authorize(q, "s3:ListBucketVersions", q.bucket, "", ctx)
+}
+
+// listObjectVersions implements GET /bucket?versions.
+func (s *Server) listObjectVersions(q *request) {
+	if !s.authorizeListVersions(q) {
+		return
+	}
+	p, aerr := parseListParams(q)
+	if aerr != nil {
+		s.fail(q, aerr)
+		return
+	}
+	keyMarker, vidMarker := q.query.Get("key-marker"), q.query.Get("version-id-marker")
+	if vidMarker != "" && keyMarker == "" {
+		s.fail(q, invalidArgument("A version-id marker cannot be specified without a key marker."))
+		return
+	}
+	if vidMarker != "" {
+		if _, err := storage.StoredVersionID(vidMarker); err != nil {
+			s.fail(q, invalidArgument("Invalid version id specified"))
+			return
+		}
+	}
+	res := listVersionsResult{
+		Name: q.bucket, Prefix: p.enc(p.prefix), KeyMarker: p.enc(keyMarker), VersionIDMarker: vidMarker,
+		MaxKeys: p.maxKeys, Delimiter: p.enc(p.delimiter), CommonPrefixes: []commonPrefix{},
+	}
+	if p.urlEncode {
+		res.EncodingType = "url"
+	}
+	if p.maxKeys == 0 {
+		if s.requireBucket(q) {
+			s.writeXML(q, http.StatusOK, &res)
+		}
+		return
+	}
+	out, err := s.st.ListObjectVersions(q.r.Context(), q.bucket, storage.ListOptions{
+		Prefix: p.prefix, Delimiter: p.delimiter, Marker: keyMarker, VersionIDMarker: vidMarker, MaxKeys: p.maxKeys,
+	})
+	if err != nil {
+		s.fail(q, err)
+		return
+	}
+	owner := placeholderOwner
+	for _, v := range out.Versions {
+		vid := v.VersionID
+		if vid == "" {
+			vid = storage.NullVersionID // an unversioned bucket's objects are the null version
+		}
+		if v.DeleteMarker {
+			res.Entries = append(res.Entries, deleteMarkerEntry{
+				Key: p.enc(v.Name), VersionID: vid, IsLatest: v.IsLatest, LastModified: isoTime(v.ModTime), Owner: &owner,
+			})
+			continue
+		}
+		res.Entries = append(res.Entries, versionEntry{
+			Key: p.enc(v.Name), VersionID: vid, IsLatest: v.IsLatest, LastModified: isoTime(v.ModTime),
+			ETag: `"` + v.ETag + `"`, Size: plainSize(v), Owner: &owner, StorageClass: "STANDARD",
+		})
+	}
+	res.CommonPrefixes = p.prefixes(out.Prefixes)
+	res.IsTruncated = out.IsTruncated
+	if out.IsTruncated {
+		res.NextKeyMarker, res.NextVersionIDMarker = p.enc(out.NextMarker), out.NextVersionIDMarker
+	}
+	s.writeXML(q, http.StatusOK, &res)
 }

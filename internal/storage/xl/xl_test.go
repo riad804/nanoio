@@ -91,6 +91,38 @@ func TestConformance(t *testing.T) {
 	}
 }
 
+func TestVersionedConformance(t *testing.T) {
+	for _, l := range layouts {
+		t.Run(l.name, func(t *testing.T) {
+			storagetest.RunVersioned(t, func(t *testing.T, locker storage.Locker) storage.StorageAPI {
+				dirs := driveDirs(t, l.drives)
+				x, err := New(dirs, Options{Locker: locker, Logger: discard, ParityBlocks: l.parity,
+					BlockSize: l.blockSize, ScanInterval: -1, StragglerGrace: time.Minute})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return x
+			})
+		})
+	}
+}
+
+func TestObjectLockConformance(t *testing.T) {
+	for _, l := range layouts {
+		t.Run(l.name, func(t *testing.T) {
+			storagetest.RunObjectLock(t, func(t *testing.T, locker storage.Locker) storage.StorageAPI {
+				dirs := driveDirs(t, l.drives)
+				x, err := New(dirs, Options{Locker: locker, Logger: discard, ParityBlocks: l.parity,
+					BlockSize: l.blockSize, ScanInterval: -1, StragglerGrace: time.Minute})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return x
+			})
+		})
+	}
+}
+
 func put(t *testing.T, x *XL, bucket, key, body string) storage.ObjectInfo {
 	t.Helper()
 	info, err := x.PutObject(bg, bucket, key, strings.NewReader(body), int64(len(body)), storage.PutOptions{})

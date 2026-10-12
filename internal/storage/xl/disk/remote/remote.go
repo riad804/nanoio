@@ -199,7 +199,9 @@ func (r *Remote) callT(ctx context.Context, d time.Duration, op, path string, in
 var opWire = map[string]string{
 	"Open": "open", "WriteFormat": "writeformat", "Ready": "ready", "Info": "info",
 	"MakeBucket": "bucket.make", "StatBucket": "bucket.stat", "ListBuckets": "bucket.list",
-	"DeleteBucket": "bucket.delete", "ListKeys": "keys", "ReadMeta": "meta.read",
+	"DeleteBucket": "bucket.delete", "ListKeys": "keys",
+	"ReadBucketVersioning": "bucket.versioning.get", "WriteBucketVersioning": "bucket.versioning.set", "ReadMeta": "meta.read",
+	"ReadBucketSettings": "bucket.settings.get", "WriteBucketObjectLock": "bucket.lock.set",
 	"StatShard": "shard.stat", "VerifyShard": "shard.verify", "ReadAt": "shard.read",
 	"PinData": "pin", "PinTouch": "pin.touch", "Unpin": "unpin", "DeleteObject": "object.delete",
 	"CreateStageFile": "stage.create", "StageAppend": "stage.append", "StageClose": "stage.close",
@@ -332,6 +334,30 @@ func (r *Remote) ListBuckets(ctx context.Context) ([]string, error) {
 // DeleteBucket implements disk.Disk.
 func (r *Remote) DeleteBucket(ctx context.Context, bucket string) error {
 	return r.call(ctx, "DeleteBucket", bucket, bucketArgs{DriveArg: r.da(), Bucket: bucket}, nil)
+}
+
+// ReadBucketVersioning implements disk.Disk.
+func (r *Remote) ReadBucketVersioning(ctx context.Context, bucket string) (string, uint64, error) {
+	var res versioningArgs
+	err := r.call(ctx, "ReadBucketVersioning", bucket, bucketArgs{DriveArg: r.da(), Bucket: bucket}, &res)
+	return res.State, res.Seq, err
+}
+
+// WriteBucketVersioning implements disk.Disk.
+func (r *Remote) WriteBucketVersioning(ctx context.Context, bucket, state string, seq uint64) error {
+	return r.call(ctx, "WriteBucketVersioning", bucket, versioningArgs{r.da(), bucket, state, seq}, nil)
+}
+
+// ReadBucketSettings implements disk.Disk.
+func (r *Remote) ReadBucketSettings(ctx context.Context, bucket string) (disk.BucketSettings, error) {
+	var res disk.BucketSettings
+	err := r.call(ctx, "ReadBucketSettings", bucket, bucketArgs{DriveArg: r.da(), Bucket: bucket}, &res)
+	return res, err
+}
+
+// WriteBucketObjectLock implements disk.Disk.
+func (r *Remote) WriteBucketObjectLock(ctx context.Context, bucket, doc string, seq uint64) error {
+	return r.call(ctx, "WriteBucketObjectLock", bucket, objectLockArgs{r.da(), bucket, doc, seq}, nil)
 }
 
 // ListKeys implements disk.Disk.

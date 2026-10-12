@@ -3,10 +3,12 @@ package xl
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"time"
 
 	"nanoio/internal/storage"
+	"nanoio/internal/storage/internal/objlock"
 	"nanoio/internal/storage/xl/disk"
 )
 
@@ -16,18 +18,20 @@ type bucketVote struct {
 }
 
 func (x *XL) voteBucket(ctx context.Context, bucket string) bucketVote {
-	var v bucketVote
-	errs := x.each(ctx, func(d *drive) error {
+	_, errs := scatter(ctx, x, x.k, 0, true, false, func(ctx context.Context, d *drive) (struct{}, error) {
 		exists, _, err := d.StatBucket(ctx, bucket)
 		if err == nil && !exists {
-			return disk.ErrNotFound
+			return struct{}{}, disk.ErrNotFound
 		}
-		return err
-	})
+		return struct{}{}, err
+	}, nil)
+	var v bucketVote
 	for _, err := range errs {
 		switch {
 		case err == nil:
 			v.present++
+		case errors.Is(err, errStraggler):
+			// not asked, in effect: says nothing either way
 		case errors.Is(err, disk.ErrNotFound):
 			v.absent++
 		default:
@@ -63,7 +67,10 @@ func (x *XL) requireBucket(ctx context.Context, bucket string) error {
 }
 
 // MakeBucket creates the bucket directory, with its marker, on every drive.
-func (x *XL) MakeBucket(ctx context.Context, bucket string, _ storage.MakeBucketOptions) error {
+// A bucket created with object lock is also made versioned and locked before
+// the exclusive bucket lock is released, so no write can see it half made;
+// if the settings do not reach a write quorum the bucket is removed again.
+func (x *XL) MakeBucket(ctx context.Context, bucket string, mopts storage.MakeBucketOptions) error {
 	if err := storage.ValidateBucketName(bucket); err != nil {
 		return err
 	}
@@ -97,6 +104,23 @@ func (x *XL) MakeBucket(ctx context.Context, bucket string, _ storage.MakeBucket
 			}
 		}
 		return quorumError(bucket, "", countNil(errs), x.writeQuorum(), errs)
+	}
+	if mopts.ObjectLock {
+		errs := x.each(ctx, func(d *drive) error {
+			if err := d.WriteBucketVersioning(ctx, bucket, string(storage.VersioningEnabled), 1); err != nil {
+				return err
+			}
+			return d.WriteBucketObjectLock(ctx, bucket, objlock.Encode(storage.ObjectLockConfig{Enabled: true}), 1)
+		})
+		if countNil(errs) < x.writeQuorum() {
+			dctx, cancel := detached(ctx)
+			defer cancel()
+			for _, d := range x.drives {
+				d.DeleteBucket(dctx, bucket)
+			}
+			return quorumError(bucket, "", countNil(errs), x.writeQuorum(), errs)
+		}
+		x.noteVersioning(bucket, storage.VersioningConfig{State: storage.VersioningEnabled, Seq: 1})
 	}
 	return nil
 }
@@ -187,6 +211,11 @@ func (x *XL) DeleteBucket(ctx context.Context, bucket string, opts storage.Delet
 	if err := x.requireBucket(ctx, bucket); err != nil {
 		return err
 	}
+	if opts.Force {
+		if err := x.checkForceDelete(ctx, bucket); err != nil {
+			return err
+		}
+	}
 	if !opts.Force {
 		has, err := x.hasObjects(ctx, bucket)
 		if err != nil {
@@ -265,4 +294,286 @@ func (x *XL) hasObjects(ctx context.Context, bucket string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// versioningView is what the drives say about a bucket's settings: the
+// versioning state and the object lock configuration, each with the
+// sequence number of the change that wrote it.
+type versioningView struct {
+	cfg  storage.VersioningConfig
+	lock lockView
+	// laggards are drives whose versioning answer differs from the agreed
+	// one; lockLaggards likewise for object lock.
+	laggards, lockLaggards []int
+}
+
+// lockView is a bucket's object lock configuration and its change sequence.
+type lockView struct {
+	cfg storage.ObjectLockConfig
+	seq uint64
+}
+
+// versioning returns the settings a read quorum of drives agrees on: for
+// each of the two documents, the (value, sequence) pair held by at least K
+// drives, the highest sequence winning if several qualify. The fast path
+// returns when K drives have answered and agree; a disagreement (a drive
+// that missed a change, or a change that reached fewer than K) falls back to
+// hearing every drive.
+func (x *XL) versioning(ctx context.Context, bucket string) (versioningView, error) {
+	collect := func(answers []disk.BucketSettings, errs []error) (versioningView, error) {
+		type vpair struct {
+			state string
+			seq   uint64
+		}
+		type lpair struct {
+			doc string
+			seq uint64
+		}
+		vcount, lcount := map[vpair]int{}, map[lpair]int{}
+		absent := 0
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				a := answers[i]
+				vcount[vpair{a.Versioning, a.VersioningSeq}]++
+				lcount[lpair{a.ObjectLock, a.ObjectLockSeq}]++
+			case errors.Is(err, disk.ErrNotFound):
+				absent++
+			}
+		}
+		var vbest vpair
+		vok := false
+		for p, n := range vcount {
+			if n >= x.k && (!vok || p.seq > vbest.seq) {
+				vbest, vok = p, true
+			}
+		}
+		var lbest lpair
+		lok := false
+		for p, n := range lcount {
+			if n >= x.k && (!lok || p.seq > lbest.seq) {
+				lbest, lok = p, true
+			}
+		}
+		if !vok || !lok {
+			if absent > len(x.drives)-x.k {
+				return versioningView{}, storage.Wrap(storage.ErrBucketNotFound, bucket, "")
+			}
+			return versioningView{}, errNoVersioningQuorum
+		}
+		lcfg, err := objlock.Decode(lbest.doc)
+		if err != nil {
+			return versioningView{}, storage.Wrap(err, bucket, "")
+		}
+		v := versioningView{
+			cfg:  storage.VersioningConfig{State: storage.VersioningState(vbest.state), Seq: vbest.seq},
+			lock: lockView{cfg: lcfg, seq: lbest.seq},
+		}
+		for i, err := range errs {
+			if err != nil {
+				continue
+			}
+			if a := answers[i]; a.Versioning != vbest.state || a.VersioningSeq != vbest.seq {
+				v.laggards = append(v.laggards, i)
+			}
+			if a := answers[i]; a.ObjectLock != lbest.doc || a.ObjectLockSeq != lbest.seq {
+				v.lockLaggards = append(v.lockLaggards, i)
+			}
+		}
+		return v, nil
+	}
+	answers, errs := scatter(ctx, x, x.k, x.stragglerGrace, true, false,
+		func(ctx context.Context, d *drive) (disk.BucketSettings, error) {
+			return d.ReadBucketSettings(ctx, bucket)
+		}, nil)
+	v, err := collect(answers, errs)
+	if err != errNoVersioningQuorum {
+		return v, err
+	}
+	// Full pass.
+	answers = make([]disk.BucketSettings, len(x.drives))
+	errs = x.each(ctx, func(d *drive) error {
+		var err error
+		answers[d.idx], err = d.ReadBucketSettings(ctx, bucket)
+		return err
+	})
+	if v, err = collect(answers, errs); err == errNoVersioningQuorum {
+		return v, storage.Wrap(fmt.Errorf("%w: no read quorum agrees on the bucket settings", storage.ErrBackendUnavailable), bucket, "")
+	}
+	return v, err
+}
+
+var errNoVersioningQuorum = errors.New("xl: no agreed versioning state")
+
+// GetBucketVersioning implements storage.StorageAPI.
+func (x *XL) GetBucketVersioning(ctx context.Context, bucket string) (storage.VersioningConfig, error) {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return storage.VersioningConfig{}, err
+	}
+	if err := x.enter(ctx); err != nil {
+		return storage.VersioningConfig{}, err
+	}
+	defer x.leave()
+	unlock, err := x.locker.RLock(ctx, bucket, "")
+	if err != nil {
+		return storage.VersioningConfig{}, err
+	}
+	defer unlock()
+	v, err := x.versioning(ctx, bucket)
+	return v.cfg, mapErr(err, bucket, "")
+}
+
+// SetBucketVersioning implements storage.StorageAPI. The bucket lock is
+// taken exclusively, so object writes (which hold it shared) see the state
+// before or after the change, never a mixture; the change itself must reach
+// a write quorum of drives.
+func (x *XL) SetBucketVersioning(ctx context.Context, bucket string, state storage.VersioningState) error {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return err
+	}
+	if !state.Valid() {
+		return storage.Wrap(storage.ErrIllegalVersioning, bucket, "")
+	}
+	if err := x.enter(ctx); err != nil {
+		return err
+	}
+	defer x.leave()
+	unlock, err := x.locker.Lock(ctx, bucket, "")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := x.requireBucket(ctx, bucket); err != nil {
+		return err
+	}
+	cur, err := x.versioning(ctx, bucket)
+	if err != nil {
+		return mapErr(err, bucket, "")
+	}
+	if err := storage.CheckVersioningTransition(cur.cfg.State, state); err != nil {
+		return storage.Wrap(err, bucket, "")
+	}
+	if state == cur.cfg.State {
+		return nil
+	}
+	if state != storage.VersioningEnabled && cur.lock.cfg.Enabled {
+		return storage.Wrap(fmt.Errorf("%w: versioning cannot be suspended on a bucket with object lock", storage.ErrInvalidBucketState), bucket, "")
+	}
+	seq := cur.cfg.Seq + 1
+	errs := x.each(ctx, func(d *drive) error {
+		return d.WriteBucketVersioning(ctx, bucket, string(state), seq)
+	})
+	if countNil(errs) < x.writeQuorum() {
+		// Those that took it are put back, so a minority does not hold a
+		// state the quorum does not.
+		dctx, cancel := detached(ctx)
+		defer cancel()
+		for i, err := range errs {
+			if err == nil {
+				x.drives[i].WriteBucketVersioning(dctx, bucket, string(cur.cfg.State), cur.cfg.Seq)
+			}
+		}
+		return quorumError(bucket, "", countNil(errs), x.writeQuorum(), errs)
+	}
+	if countNil(errs) < len(x.drives) {
+		x.log.Warn("xl: versioning change did not reach every drive; heal will converge them", "bucket", bucket)
+	}
+	x.noteVersioning(bucket, storage.VersioningConfig{State: state, Seq: seq})
+	return nil
+}
+
+// GetBucketObjectLock implements storage.StorageAPI.
+func (x *XL) GetBucketObjectLock(ctx context.Context, bucket string) (storage.ObjectLockConfig, error) {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return storage.ObjectLockConfig{}, err
+	}
+	if err := x.enter(ctx); err != nil {
+		return storage.ObjectLockConfig{}, err
+	}
+	defer x.leave()
+	unlock, err := x.locker.RLock(ctx, bucket, "")
+	if err != nil {
+		return storage.ObjectLockConfig{}, err
+	}
+	defer unlock()
+	v, err := x.versioning(ctx, bucket)
+	v.lock.cfg.Seq = v.lock.seq
+	return v.lock.cfg, mapErr(err, bucket, "")
+}
+
+// SetBucketObjectLock implements storage.StorageAPI. Like a versioning
+// change it runs under the exclusive bucket lock and must reach a write
+// quorum, so a write sees the default retention from before or after it.
+func (x *XL) SetBucketObjectLock(ctx context.Context, bucket string, cfg storage.ObjectLockConfig) error {
+	if err := storage.ValidateBucketName(bucket); err != nil {
+		return err
+	}
+	if err := x.enter(ctx); err != nil {
+		return err
+	}
+	defer x.leave()
+	unlock, err := x.locker.Lock(ctx, bucket, "")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := x.requireBucket(ctx, bucket); err != nil {
+		return err
+	}
+	cur, err := x.versioning(ctx, bucket)
+	if err != nil {
+		return mapErr(err, bucket, "")
+	}
+	if err := objlock.CheckConfig(cur.lock.cfg, cfg); err != nil {
+		return storage.Wrap(err, bucket, "")
+	}
+	doc, seq := objlock.Encode(cfg), cur.lock.seq+1
+	prevDoc := objlock.Encode(cur.lock.cfg)
+	errs := x.each(ctx, func(d *drive) error { return d.WriteBucketObjectLock(ctx, bucket, doc, seq) })
+	if countNil(errs) < x.writeQuorum() {
+		dctx, cancel := detached(ctx)
+		defer cancel()
+		for i, err := range errs {
+			if err == nil {
+				x.drives[i].WriteBucketObjectLock(dctx, bucket, prevDoc, cur.lock.seq)
+			}
+		}
+		return quorumError(bucket, "", countNil(errs), x.writeQuorum(), errs)
+	}
+	if countNil(errs) < len(x.drives) {
+		x.log.Warn("xl: object lock change did not reach every drive; heal will converge them", "bucket", bucket)
+	}
+	return nil
+}
+
+// checkForceDelete refuses a forced bucket deletion that would destroy a
+// version object lock protects. Keys are confirmed by a metadata read
+// quorum; one that cannot be read cannot be shown unprotected, so it blocks
+// the deletion as well.
+func (x *XL) checkForceDelete(ctx context.Context, bucket string) error {
+	v, err := x.versioning(ctx, bucket)
+	if err != nil {
+		return mapErr(err, bucket, "")
+	}
+	if !v.lock.cfg.Enabled {
+		return nil
+	}
+	keys, err := x.listKeys(ctx, bucket, "")
+	if err != nil {
+		return mapErr(err, bucket, "")
+	}
+	guard := objlock.Guard(time.Now(), false)
+	for _, k := range keys {
+		st := x.stateOf(ctx, bucket, k)
+		if !st.found(x.k) {
+			if st.missing(len(x.drives), x.k) {
+				continue
+			}
+			return storage.Wrap(fmt.Errorf("%w: cannot verify that %q is unprotected", storage.ErrObjectLocked, k), bucket, "")
+		}
+		if err := st.file.Protected(guard); err != nil {
+			return objlock.Err(err, bucket, k)
+		}
+	}
+	return nil
 }

@@ -273,7 +273,11 @@ func newToken() (string, error) {
 }
 
 type bucketDoc struct {
-	Created time.Time `json:"created"`
+	Created       time.Time `json:"created"`
+	Versioning    string    `json:"versioning,omitempty"`
+	VersioningSeq uint64    `json:"versioningSeq,omitempty"`
+	ObjectLock    string    `json:"objectLock,omitempty"`
+	ObjectLockSeq uint64    `json:"objectLockSeq,omitempty"`
 }
 
 // MakeBucket implements Disk.
@@ -515,6 +519,11 @@ func (d *Local) deleteObject(bucket, object string) error {
 	var dataDirs []string
 	if data, err := os.ReadFile(filepath.Join(dir, storage.MetaFileName)); err == nil {
 		if f, derr := meta.Decode(data); derr == nil {
+			// Removing a whole key is how nothing may get around object
+			// lock: a key holding a protected version stays.
+			if err := f.Protected(meta.Guard{}); err != nil {
+				return err
+			}
 			for _, v := range f.Versions {
 				if v.DataDir != "" {
 					dataDirs = append(dataDirs, filepath.Join(dir, v.DataDir))
@@ -641,10 +650,13 @@ func (c *localCommit) Finish(ctx context.Context) error {
 	return nil
 }
 
-// CommitObject implements Disk. Its steps are: place the data dir (setting
-// aside any same-named one inside the stage, restored if publishing
-// fails), keep a backup of the previous xl.meta, and rename the new xl.meta
-// into place, which is this drive's commit point.
+// commitObject implements Disk.CommitObject. Its steps are: read this
+// drive's current xl.meta, check the conditional generation, apply the
+// operation to a copy, place any staged data directories (setting aside a
+// same-named one inside the stage, restored if publishing fails), and
+// rename the new xl.meta into place (or remove it when no version is left),
+// which is this drive's commit point. The data of versions the change
+// dropped is removed only at Finish.
 func (d *Local) commitObject(req CommitRequest) (Commit, error) {
 	if err := d.check(); err != nil {
 		return nil, err
@@ -657,116 +669,294 @@ func (d *Local) commitObject(req CommitRequest) (Commit, error) {
 		return nil, err
 	}
 	bucketDir, _ := d.path(req.Bucket)
-	stageDir, err := d.stagePath(req.StageID)
-	if err != nil {
-		return nil, err
-	}
-	stagedData := filepath.Join(stageDir, req.DataDir)
 	metaPath := filepath.Join(objDir, storage.MetaFileName)
+	stageDir := ""
+	if req.StageID != "" {
+		if stageDir, err = d.stagePath(req.StageID); err != nil {
+			return nil, err
+		}
+	}
 
 	km := d.keyLock(req.Bucket, req.Object)
 	km.Lock()
 	defer km.Unlock()
 
-	// What is there now: its bytes (for rollback) and its data dir (to
-	// remove once the commit is final).
 	oldBytes, rerr := os.ReadFile(metaPath)
 	if rerr != nil && !errors.Is(rerr, iofs.ErrNotExist) {
 		return nil, rerr
 	}
-	oldDataDir := ""
-	if rerr == nil {
-		if old, derr := meta.Decode(oldBytes); derr == nil {
-			if ov := old.Find(""); ov != nil {
-				if req.CheckGen && ov.Generation > req.PrevGen {
-					return nil, fmt.Errorf("%w: drive holds generation %d, write was based on %d",
-						ErrConflict, ov.Generation, req.PrevGen)
-				}
-				if ov.DataDir != "" && ov.DataDir != req.DataDir {
-					oldDataDir = filepath.Join(objDir, ov.DataDir)
-				}
-			}
-		}
-	}
-	file := &meta.File{Format: meta.FormatVersion}
-	file.Add(req.Version)
-	enc, err := meta.Encode(file)
-	if err != nil {
-		return nil, err
-	}
-	stagedMeta := filepath.Join(stageDir, storage.MetaFileName)
-	os.Remove(stagedMeta)
-	if err := fsutil.WriteFileSync(stagedMeta, enc, filePerm); err != nil {
-		return nil, err
-	}
-
-	newData := filepath.Join(objDir, req.DataDir)
-	aside := ""
-	for attempt := 0; ; attempt++ {
-		err = fsutil.MkdirAllSync(bucketDir, objDir, dirPerm)
-		if err == nil {
-			if _, serr := os.Stat(newData); serr == nil && aside == "" {
-				aside = filepath.Join(stageDir, "replaced-"+req.DataDir)
-				if err = os.Rename(newData, aside); err != nil {
-					aside = ""
-				}
-			}
-		}
-		if err == nil {
-			err = os.Rename(stagedData, newData)
-		}
-		if err == nil {
-			break
-		}
-		if fsutil.IsPruneRace(err) && attempt < 20 {
-			continue
-		}
-		if aside != "" {
-			os.Rename(aside, newData)
-		}
-		return nil, err
-	}
-	undoData := func() {
-		os.RemoveAll(newData)
-		if aside != "" {
-			os.Rename(aside, newData)
-		}
-	}
-	if err := fsutil.SyncDir(objDir); err != nil {
-		undoData()
-		return nil, err
-	}
-	if err := d.faultAt(FaultDataRenamed); err != nil {
-		undoData()
-		return nil, err
-	}
-
-	backup := filepath.Join(stageDir, "xl.meta.bak")
 	hadOld := rerr == nil
+	var file *meta.File
 	if hadOld {
-		os.Remove(backup)
-		if err := fsutil.WriteFileSync(backup, oldBytes, filePerm); err != nil {
-			undoData()
+		f, derr := meta.Decode(oldBytes)
+		switch {
+		case derr == nil:
+			file = f
+		case req.Op == OpReplace:
+			// A repair overwrites unreadable metadata.
+		default:
+			return nil, fmt.Errorf("%w: xl.meta of %s/%s is unreadable (%v); it needs repair, not a mutation",
+				storage.ErrCorrupted, req.Bucket, req.Object, derr)
+		}
+	}
+	if req.CheckGen && file != nil && file.Generation() > req.PrevGen {
+		return nil, fmt.Errorf("%w: drive holds generation %d, write was based on %d",
+			ErrConflict, file.Generation(), req.PrevGen)
+	}
+
+	// Apply the operation to this drive's own copy.
+	var next *meta.File
+	var superseded, place []string
+	stale := func(err error) error {
+		if errors.Is(err, meta.ErrStale) {
+			return fmt.Errorf("%w: %v", ErrConflict, err)
+		}
+		return err
+	}
+	switch req.Op {
+	case OpPut, OpMarker:
+		next = file
+		if next == nil {
+			next = &meta.File{Format: meta.FormatVersion}
+		}
+		v := req.Version
+		if v.Seq == 0 {
+			v.Seq = req.Seq
+		}
+		if v.Seq == 0 {
+			// A caller that does not number its writes (a single drive,
+			// a test) gets the next number.
+			v.Seq = next.Generation() + 1
+		}
+		if req.Op == OpPut {
+			superseded, err = next.ApplyPut(v, req.Guard)
+			place = []string{req.DataDir}
+		} else {
+			superseded, err = next.ApplyMarker(v.VersionID, v.Seq, v.ModTime, req.Guard)
+		}
+		if err != nil {
+			return nil, stale(err)
+		}
+	case OpRemove:
+		if file == nil {
+			return &localCommit{}, nil // nothing here to remove
+		}
+		next = file
+		if req.Seq == 0 {
+			req.Seq = next.Generation() + 1
+		}
+		superseded, err = next.ApplyRemove(req.VersionID, req.Seq, req.Guard)
+		switch {
+		case errors.Is(err, meta.ErrNoSuchVersion):
+			// This drive never had it (it missed the write): record the
+			// new generation and leave the rest as it is.
+			next.Gen, superseded = req.Seq, nil
+		case err != nil:
+			return nil, stale(err)
+		}
+	case OpSetLock:
+		if file == nil {
+			return nil, fmt.Errorf("%w: %s/%s has no xl.meta here", ErrNotFound, req.Bucket, req.Object)
+		}
+		next = file
+		if req.Seq == 0 {
+			req.Seq = next.Generation() + 1
+		}
+		err = next.ApplySetLock(req.VersionID, req.Seq, req.Lock, req.Guard)
+		switch {
+		case errors.Is(err, meta.ErrNoSuchVersion):
+			// A drive that never had the version cannot hold its lock;
+			// it is stale and heal will bring it level.
+			return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+		case err != nil:
+			return nil, stale(err)
+		}
+	case OpSetMeta:
+		if file == nil {
+			return nil, fmt.Errorf("%w: %s/%s has no xl.meta here", ErrNotFound, req.Bucket, req.Object)
+		}
+		if req.Meta == nil {
+			return nil, errors.New("disk: OpSetMeta without Meta")
+		}
+		next = file
+		if req.Seq == 0 {
+			req.Seq = next.Generation() + 1
+		}
+		err = next.ApplySetMeta(req.VersionID, req.Seq, *req.Meta)
+		switch {
+		case errors.Is(err, meta.ErrNoSuchVersion):
+			return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+		case err != nil:
+			return nil, stale(err)
+		}
+	case OpReplace:
+		if req.File == nil {
+			return nil, errors.New("disk: OpReplace without a file")
+		}
+		next = req.File
+		keep := map[string]bool{}
+		for _, v := range next.Versions {
+			if v.DataDir != "" {
+				keep[v.DataDir] = true
+			}
+		}
+		if file != nil {
+			for _, v := range file.Versions {
+				if v.DataDir != "" && !keep[v.DataDir] {
+					superseded = append(superseded, v.DataDir)
+				}
+			}
+		}
+		place = req.DataDirs
+	default:
+		return nil, fmt.Errorf("disk: unknown commit op %d", req.Op)
+	}
+	// A data directory that is being (re)placed under its own name is not
+	// something to remove afterwards.
+	for _, p := range place {
+		superseded = removeString(superseded, p)
+	}
+
+	empty := len(next.Versions) == 0
+	var enc []byte
+	stagedMeta := ""
+	if !empty {
+		if enc, err = meta.Encode(next); err != nil {
+			return nil, err
+		}
+		tok, terr := newToken()
+		if terr != nil {
+			return nil, terr
+		}
+		stagedMeta = filepath.Join(d.tmp(), "commit-"+tok)
+		if err := fsutil.WriteFileSync(stagedMeta, enc, filePerm); err != nil {
 			return nil, err
 		}
 	}
-	if err := os.Rename(stagedMeta, metaPath); err != nil {
-		undoData()
+	dropStagedMeta := func() {
+		if stagedMeta != "" {
+			os.Remove(stagedMeta)
+		}
+	}
+
+	// Place staged data directories.
+	var undoPlaced []func()
+	revertPlaced := func() {
+		for i := len(undoPlaced) - 1; i >= 0; i-- {
+			undoPlaced[i]()
+		}
+	}
+	for _, name := range place {
+		staged := filepath.Join(stageDir, name)
+		dest := filepath.Join(objDir, name)
+		aside := ""
+		for attempt := 0; ; attempt++ {
+			err = fsutil.MkdirAllSync(bucketDir, objDir, dirPerm)
+			if err == nil {
+				if _, serr := os.Stat(dest); serr == nil && aside == "" {
+					aside = filepath.Join(stageDir, "replaced-"+name)
+					if err = os.Rename(dest, aside); err != nil {
+						aside = ""
+					}
+				}
+			}
+			if err == nil {
+				err = os.Rename(staged, dest)
+			}
+			if err == nil {
+				break
+			}
+			if fsutil.IsPruneRace(err) && attempt < 20 {
+				continue
+			}
+			if aside != "" {
+				os.Rename(aside, dest)
+			}
+			revertPlaced()
+			dropStagedMeta()
+			return nil, err
+		}
+		undoPlaced = append(undoPlaced, func() {
+			os.RemoveAll(dest)
+			if aside != "" {
+				os.Rename(aside, dest)
+			}
+		})
+	}
+	if len(place) > 0 {
+		if err := fsutil.SyncDir(objDir); err != nil {
+			revertPlaced()
+			dropStagedMeta()
+			return nil, err
+		}
+	}
+	if err := d.faultAt(FaultDataRenamed); err != nil {
+		revertPlaced()
+		dropStagedMeta()
 		return nil, err
 	}
+
+	// A change that places no data (a delete marker) may be the first thing
+	// this key's directory ever holds.
+	if !empty && len(place) == 0 {
+		for attempt := 0; ; attempt++ {
+			if err = fsutil.MkdirAllSync(bucketDir, objDir, dirPerm); err == nil {
+				break
+			}
+			if fsutil.IsPruneRace(err) && attempt < 20 {
+				continue
+			}
+			revertPlaced()
+			dropStagedMeta()
+			return nil, err
+		}
+	}
+
+	// Commit point.
+	if empty {
+		if err := os.Remove(metaPath); err != nil && !errors.Is(err, iofs.ErrNotExist) {
+			revertPlaced()
+			return nil, err
+		}
+	} else {
+		var rerr error
+		for attempt := 0; ; attempt++ {
+			if rerr = os.Rename(stagedMeta, metaPath); rerr == nil {
+				break
+			}
+			// A concurrent delete of a sibling can prune the directory
+			// just created; recreate it and try again.
+			if fsutil.IsPruneRace(rerr) && attempt < 20 {
+				if fsutil.MkdirAllSync(bucketDir, objDir, dirPerm) == nil {
+					continue
+				}
+			}
+			revertPlaced()
+			dropStagedMeta()
+			return nil, rerr
+		}
+	}
 	fsutil.SyncDir(objDir) // published; a failed sync is left for the quorum to judge
-	revert := func() {
+
+	revertMeta := func() {
 		if hadOld {
-			os.Rename(backup, metaPath)
+			if tok, terr := newToken(); terr == nil {
+				tmp := filepath.Join(d.tmp(), "restore-"+tok)
+				if fsutil.WriteFileSync(tmp, oldBytes, filePerm) == nil {
+					if os.Rename(tmp, metaPath) != nil {
+						os.Remove(tmp)
+					}
+				}
+			}
 		} else {
 			os.Remove(metaPath)
 		}
-		undoData()
+		revertPlaced()
 	}
 	if err := d.faultAt(FaultMetaRenamed); err != nil {
 		// The drive did commit; report failure so quorum accounting is
 		// conservative, and revert it (the key lock is still held).
-		revert()
+		revertMeta()
 		return nil, err
 	}
 	// A rollback arrives later, possibly after another writer committed
@@ -774,19 +964,42 @@ func (d *Local) commitObject(req CommitRequest) (Commit, error) {
 	undo := func() {
 		km.Lock()
 		defer km.Unlock()
-		if cur, err := os.ReadFile(metaPath); err != nil || !bytes.Equal(cur, enc) {
+		cur, err := os.ReadFile(metaPath)
+		switch {
+		case empty:
+			if !errors.Is(err, iofs.ErrNotExist) {
+				return
+			}
+		case err != nil || !bytes.Equal(cur, enc):
 			return
 		}
-		revert()
+		revertMeta()
 	}
 	return &localCommit{
 		undo: undo,
 		finish: func() {
-			if oldDataDir != "" {
-				d.pins.Remove(oldDataDir)
+			for _, name := range superseded {
+				d.pins.Remove(filepath.Join(objDir, name))
+			}
+			if empty {
+				for p := objDir; p != bucketDir && strings.HasPrefix(p, bucketDir); p = filepath.Dir(p) {
+					if os.Remove(p) != nil {
+						break
+					}
+				}
 			}
 		},
 	}, nil
+}
+
+func removeString(s []string, v string) []string {
+	out := s[:0]
+	for _, x := range s {
+		if x != v {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // LinkPartIntoStage implements Disk.
@@ -832,3 +1045,91 @@ func linkOrCopy(src, dst string) error {
 }
 
 var _ = io.EOF
+
+// readBucketDoc loads the bucket's marker document; the second result
+// reports whether the bucket directory exists.
+func (d *Local) readBucketDoc(bucket string) (doc bucketDoc, dir string, err error) {
+	dir, err = d.path(bucket)
+	if err != nil {
+		return doc, "", err
+	}
+	st, err := os.Lstat(dir)
+	if err != nil || !st.IsDir() {
+		return doc, dir, ErrNotFound
+	}
+	doc.Created = st.ModTime().UTC()
+	if data, rerr := os.ReadFile(filepath.Join(dir, bucketMarker)); rerr == nil {
+		var m bucketDoc
+		if json.Unmarshal(data, &m) == nil {
+			if !m.Created.IsZero() {
+				doc.Created = m.Created.UTC()
+			}
+			doc.Versioning, doc.VersioningSeq = m.Versioning, m.VersioningSeq
+			doc.ObjectLock, doc.ObjectLockSeq = m.ObjectLock, m.ObjectLockSeq
+		}
+	}
+	return doc, dir, nil
+}
+
+func (d *Local) readBucketVersioning(bucket string) (string, uint64, error) {
+	if err := d.check(); err != nil {
+		return "", 0, err
+	}
+	doc, _, err := d.readBucketDoc(bucket)
+	return doc.Versioning, doc.VersioningSeq, err
+}
+
+func (d *Local) readBucketSettings(bucket string) (BucketSettings, error) {
+	if err := d.check(); err != nil {
+		return BucketSettings{}, err
+	}
+	doc, _, err := d.readBucketDoc(bucket)
+	return BucketSettings{Versioning: doc.Versioning, VersioningSeq: doc.VersioningSeq,
+		ObjectLock: doc.ObjectLock, ObjectLockSeq: doc.ObjectLockSeq}, err
+}
+
+func (d *Local) writeBucketVersioning(bucket, state string, seq uint64) error {
+	if err := d.check(); err != nil {
+		return err
+	}
+	doc, dir, err := d.readBucketDoc(bucket)
+	if err != nil {
+		return err
+	}
+	doc.Versioning, doc.VersioningSeq = state, seq
+	return d.writeBucketDoc(dir, doc)
+}
+
+func (d *Local) writeBucketObjectLock(bucket, lockDoc string, seq uint64) error {
+	if err := d.check(); err != nil {
+		return err
+	}
+	doc, dir, err := d.readBucketDoc(bucket)
+	if err != nil {
+		return err
+	}
+	doc.ObjectLock, doc.ObjectLockSeq = lockDoc, seq
+	return d.writeBucketDoc(dir, doc)
+}
+
+// writeBucketDoc replaces the bucket marker atomically.
+func (d *Local) writeBucketDoc(dir string, doc bucketDoc) error {
+	data, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	tok, err := newToken()
+	if err != nil {
+		return err
+	}
+	staged := filepath.Join(d.tmp(), "bucketdoc-"+tok)
+	if err := fsutil.WriteFileSync(staged, data, filePerm); err != nil {
+		os.Remove(staged)
+		return err
+	}
+	if err := os.Rename(staged, filepath.Join(dir, bucketMarker)); err != nil {
+		os.Remove(staged)
+		return err
+	}
+	return fsutil.SyncDir(dir)
+}

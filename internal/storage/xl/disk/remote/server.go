@@ -283,6 +283,18 @@ type (
 		Bucket  string    `json:"bucket"`
 		Created time.Time `json:"created,omitempty"`
 	}
+	versioningArgs struct {
+		DriveArg
+		Bucket string `json:"bucket"`
+		State  string `json:"state"`
+		Seq    uint64 `json:"seq"`
+	}
+	objectLockArgs struct {
+		DriveArg
+		Bucket string `json:"bucket"`
+		Doc    string `json:"doc"`
+		Seq    uint64 `json:"seq"`
+	}
 	madeRes struct {
 		Made bool `json:"made"`
 	}
@@ -420,6 +432,19 @@ func (s *Server) Register(rs *rpc.Server) {
 	})
 	reg(s, rs, "bucket.delete", func(ctx context.Context, d disk.Disk, a bucketArgs) (empty, error) {
 		return empty{}, d.DeleteBucket(ctx, a.Bucket)
+	})
+	reg(s, rs, "bucket.versioning.get", func(ctx context.Context, d disk.Disk, a bucketArgs) (versioningArgs, error) {
+		st, seq, err := d.ReadBucketVersioning(ctx, a.Bucket)
+		return versioningArgs{State: st, Seq: seq}, err
+	})
+	reg(s, rs, "bucket.versioning.set", func(ctx context.Context, d disk.Disk, a versioningArgs) (empty, error) {
+		return empty{}, d.WriteBucketVersioning(ctx, a.Bucket, a.State, a.Seq)
+	})
+	reg(s, rs, "bucket.settings.get", func(ctx context.Context, d disk.Disk, a bucketArgs) (disk.BucketSettings, error) {
+		return d.ReadBucketSettings(ctx, a.Bucket)
+	})
+	reg(s, rs, "bucket.lock.set", func(ctx context.Context, d disk.Disk, a objectLockArgs) (empty, error) {
+		return empty{}, d.WriteBucketObjectLock(ctx, a.Bucket, a.Doc, a.Seq)
 	})
 	rs.Handle("disk.keys", rpc.JSON(func(ctx context.Context, _ string, a listKeysArgs) (namesRes, error) {
 		d, err := s.disk(a)

@@ -66,15 +66,19 @@ func mkbucket(t *testing.T, f *FS, name string) {
 	}
 }
 
-func TestConformance(t *testing.T) {
-	storagetest.Run(t, func(t *testing.T, l storage.Locker) storage.StorageAPI {
-		f, err := New(t.TempDir(), Options{Locker: l, Logger: discard})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return f
-	})
+func newConformanceFS(t *testing.T, l storage.Locker) storage.StorageAPI {
+	f, err := New(t.TempDir(), Options{Locker: l, Logger: discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f
 }
+
+func TestConformance(t *testing.T) { storagetest.Run(t, newConformanceFS) }
+
+func TestVersionedConformance(t *testing.T) { storagetest.RunVersioned(t, newConformanceFS) }
+
+func TestObjectLockConformance(t *testing.T) { storagetest.RunObjectLock(t, newConformanceFS) }
 
 func TestNewValidation(t *testing.T) {
 	tests := []struct {
@@ -429,46 +433,13 @@ func TestNotImplementedIsExplicit(t *testing.T) {
 	mkbucket(t, f, "nim")
 	put(t, f, "nim", "k", "v")
 	calls := map[string]func() error{
-		"versioned put": func() error {
-			_, err := f.PutObject(bg, "nim", "k", strings.NewReader("v"), 1, storage.PutOptions{Versioned: true})
-			return err
-		},
-		"versioned delete": func() error {
-			_, err := f.DeleteObject(bg, "nim", "k", storage.DeleteOptions{Versioned: true})
-			return err
-		},
-		"delete by version id": func() error {
-			_, err := f.DeleteObject(bg, "nim", "k", storage.DeleteOptions{VersionID: "abc"})
-			return err
-		},
 		"CopyObject": func() error {
 			_, err := f.CopyObject(bg, storage.ObjectRef{}, storage.ObjectRef{}, storage.CopyOptions{})
-			return err
-		},
-		"UpdateObjectMetadata": func() error {
-			_, err := f.UpdateObjectMetadata(bg, "nim", "k", storage.UpdateMetaOptions{})
-			return err
-		},
-		"ListObjectVersions": func() error {
-			_, err := f.ListObjectVersions(bg, "nim", storage.ListOptions{})
-			return err
-		},
-		"versioned NewMultipartUpload": func() error {
-			_, err := f.NewMultipartUpload(bg, "nim", "k", storage.PutOptions{Versioned: true})
-			return err
-		},
-		"versioned CompleteMultipartUpload": func() error {
-			_, err := f.CompleteMultipartUpload(bg, "nim", "k", "00000000-0000-4000-8000-000000000000",
-				[]storage.CompletePart{{Number: 1, ETag: "x"}}, storage.PutOptions{Versioned: true})
 			return err
 		},
 	}
 	for name, call := range calls {
 		t.Run(name, func(t *testing.T) { wantIs(t, name, call(), storage.ErrNotImplemented) })
-	}
-	// And the refused versioned put did not damage the object.
-	if got, err := read(t, f, "nim", "k"); err != nil || got != "v" {
-		t.Errorf("object after refused calls: %q, %v", got, err)
 	}
 }
 
@@ -477,7 +448,13 @@ func TestGetByUnknownVersion(t *testing.T) {
 	mkbucket(t, f, "ver")
 	put(t, f, "ver", "k", "v")
 	_, err := f.StatObject(bg, "ver", "k", storage.GetOptions{VersionID: "no-such-version"})
-	wantIs(t, "StatObject(version)", err, storage.ErrVersionNotFound)
+	wantIs(t, "StatObject(malformed version)", err, storage.ErrInvalidVersionID)
+	_, err = f.StatObject(bg, "ver", "k", storage.GetOptions{VersionID: "9f0c1b9e-1111-4222-8333-444455556666"})
+	wantIs(t, "StatObject(unknown version)", err, storage.ErrVersionNotFound)
+	// The null version is what an unversioned bucket holds.
+	if _, err := f.StatObject(bg, "ver", "k", storage.GetOptions{VersionID: "null"}); err != nil {
+		t.Errorf("StatObject(null): %v", err)
+	}
 }
 
 func TestInfo(t *testing.T) {

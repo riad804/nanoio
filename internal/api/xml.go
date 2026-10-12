@@ -109,7 +109,10 @@ type deleteResult struct {
 }
 
 type deletedEntry struct {
-	Key string `xml:"Key"`
+	Key                   string `xml:"Key"`
+	VersionID             string `xml:"VersionId,omitempty"`
+	DeleteMarker          bool   `xml:"DeleteMarker,omitempty"`
+	DeleteMarkerVersionID string `xml:"DeleteMarkerVersionId,omitempty"`
 }
 
 type deleteError struct {
@@ -216,4 +219,44 @@ type copyPartResult struct {
 	XMLName      xml.Name `xml:"http://s3.amazonaws.com/doc/2006-03-01/ CopyPartResult"`
 	LastModified string   `xml:"LastModified"`
 	ETag         string   `xml:"ETag"`
+}
+
+// listVersionsResult is the ListObjectVersions response. Versions and
+// delete markers are interleaved in listing order, which a pair of typed
+// slices could not express.
+type listVersionsResult struct {
+	XMLName             xml.Name       `xml:"http://s3.amazonaws.com/doc/2006-03-01/ ListVersionsResult"`
+	Name                string         `xml:"Name"`
+	Prefix              string         `xml:"Prefix"`
+	KeyMarker           string         `xml:"KeyMarker"`
+	VersionIDMarker     string         `xml:"VersionIdMarker"`
+	NextKeyMarker       string         `xml:"NextKeyMarker,omitempty"`
+	NextVersionIDMarker string         `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int            `xml:"MaxKeys"`
+	Delimiter           string         `xml:"Delimiter,omitempty"`
+	EncodingType        string         `xml:"EncodingType,omitempty"`
+	IsTruncated         bool           `xml:"IsTruncated"`
+	Entries             []any          `xml:",any"`
+	CommonPrefixes      []commonPrefix `xml:"CommonPrefixes"`
+}
+
+type versionEntry struct {
+	XMLName      xml.Name    `xml:"Version"`
+	Key          string      `xml:"Key"`
+	VersionID    string      `xml:"VersionId"`
+	IsLatest     bool        `xml:"IsLatest"`
+	LastModified string      `xml:"LastModified"`
+	ETag         string      `xml:"ETag"`
+	Size         int64       `xml:"Size"`
+	Owner        *ownerEntry `xml:"Owner,omitempty"`
+	StorageClass string      `xml:"StorageClass"`
+}
+
+type deleteMarkerEntry struct {
+	XMLName      xml.Name    `xml:"DeleteMarker"`
+	Key          string      `xml:"Key"`
+	VersionID    string      `xml:"VersionId"`
+	IsLatest     bool        `xml:"IsLatest"`
+	LastModified string      `xml:"LastModified"`
+	Owner        *ownerEntry `xml:"Owner,omitempty"`
 }
