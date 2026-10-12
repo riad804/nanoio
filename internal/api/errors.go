@@ -54,7 +54,7 @@ var authErrors = []struct {
 	{auth.ErrRequestTimeTooSkewed, APIError{"RequestTimeTooSkewed", "The difference between the request time and the current time is too large.", 403}},
 	{auth.ErrRequestExpired, APIError{"AccessDenied", "Request has expired.", 403}},
 	{auth.ErrUnsupportedAlgorithm, APIError{"InvalidRequest", "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.", 400}},
-	{auth.ErrInvalidToken, APIError{"InvalidToken", "The provided token is malformed or otherwise invalid. Temporary security credentials are not supported.", 400}},
+	{auth.ErrInvalidToken, APIError{"InvalidToken", "The provided token is malformed or otherwise invalid.", 400}},
 	{auth.ErrInvalidPayloadHash, APIError{"InvalidArgument", "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER or a valid sha256 value.", 400}},
 	{auth.ErrUnsignedHeaders, APIError{"AccessDenied", "There were headers present in the request which were not signed.", 403}},
 	{auth.ErrAmbiguousAuth, APIError{"InvalidArgument", "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, Signature query string parameter or the Authorization header should be specified.", 400}},
@@ -107,6 +107,7 @@ var storageErrors = []struct {
 	{storage.ErrObjectLockNotEnabled, APIError{"InvalidRequest", "Bucket is missing Object Lock Configuration", 400}},
 	{storage.ErrInvalidRetention, APIError{"InvalidArgument", "The retention is not valid.", 400}},
 	{storage.ErrInvalidBucketState, APIError{"InvalidBucketState", "The request is not valid with the current state of the bucket.", 409}},
+	{storage.ErrInvalidStorageClass, APIError{"InvalidStorageClass", "The storage class you specified is not valid.", 400}},
 	{storage.ErrNotImplemented, APIError{"NotImplemented", "A header you provided implies functionality that is not implemented.", 501}},
 }
 

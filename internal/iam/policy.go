@@ -29,6 +29,21 @@ type Statement struct {
 	Resources    []string
 	NotResources []string
 	Conditions   []Condition
+	// Principals and NotPrincipals are set only in a resource-based
+	// (bucket) policy, which requires exactly one of them. "*" matches
+	// every caller, anonymous included.
+	Principals    []string
+	NotPrincipals []string
+	// AuthenticatedOnly restricts a statement to callers that presented
+	// valid credentials (the ACL group AuthenticatedUsers).
+	AuthenticatedOnly bool
+	// LiteralPrincipals compares Principals exactly instead of as globs;
+	// used for statements generated from an ACL, whose grantee is data.
+	LiteralPrincipals bool
+	// LiteralResources compares Resources exactly instead of as globs; used
+	// for statements generated from an object ACL, where the key is data and
+	// may contain '*' or '?'.
+	LiteralResources bool
 }
 
 // Condition is one operator/key pair with its values.
@@ -49,6 +64,10 @@ type Request struct {
 	// Context holds condition keys, lower-case: "aws:sourceip",
 	// "aws:securetransport", "s3:prefix", "s3:delimiter", "s3:max-keys".
 	Context map[string]string
+	// Lookup supplies a condition key that is not in Context, on demand. It
+	// lets a key that costs a storage read (s3:ExistingObjectTag/<key>) be
+	// fetched only when some statement actually conditions on it.
+	Lookup func(key string) (string, bool)
 }
 
 // ARN returns the resource ARN the request targets.
@@ -185,7 +204,7 @@ func ParsePolicy(data []byte) (*Policy, error) {
 	}
 	p := &Policy{Version: raw.Version}
 	for i, sb := range stmts {
-		st, err := parseStatement(sb)
+		st, err := parseStatement(sb, false)
 		if err != nil {
 			return nil, fmt.Errorf("policy: statement %d: %w", i, err)
 		}
@@ -194,18 +213,31 @@ func ParsePolicy(data []byte) (*Policy, error) {
 	return p, nil
 }
 
-func parseStatement(b json.RawMessage) (Statement, error) {
+func parseStatement(b json.RawMessage, resourceBased bool) (Statement, error) {
 	var r rawStatement
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&r); err != nil {
 		return Statement{}, err
 	}
-	if len(r.Principal) > 0 || len(r.NotPrincipal) > 0 {
-		return Statement{}, errors.New("Principal and NotPrincipal are not allowed in an identity policy")
-	}
 	st := Statement{SID: r.Sid,
 		Actions: r.Action, NotActions: r.NotAction, Resources: r.Resource, NotResources: r.NotResource}
+	if resourceBased {
+		if (len(r.Principal) == 0) == (len(r.NotPrincipal) == 0) {
+			return Statement{}, errors.New("exactly one of Principal and NotPrincipal is required")
+		}
+		var err error
+		if len(r.Principal) > 0 {
+			st.Principals, err = parsePrincipals(r.Principal)
+		} else {
+			st.NotPrincipals, err = parsePrincipals(r.NotPrincipal)
+		}
+		if err != nil {
+			return Statement{}, err
+		}
+	} else if len(r.Principal) > 0 || len(r.NotPrincipal) > 0 {
+		return Statement{}, errors.New("Principal and NotPrincipal are not allowed in an identity policy")
+	}
 	switch r.Effect {
 	case "Allow":
 		st.Allow = true
@@ -216,12 +248,30 @@ func parseStatement(b json.RawMessage) (Statement, error) {
 	if (len(st.Actions) == 0) == (len(st.NotActions) == 0) {
 		return Statement{}, errors.New("exactly one of Action and NotAction is required")
 	}
+	if len(st.Resources) == 0 && len(st.NotResources) == 0 && len(st.Actions) > 0 {
+		// Administrative actions name no resource (MinIO's own policies
+		// omit it); S3 actions still must.
+		admin := true
+		for _, a := range st.Actions {
+			if la := strings.ToLower(a); la == "*" || strings.HasPrefix(la, "s3:") {
+				admin = false
+			}
+		}
+		if admin {
+			st.Resources = []string{"*"}
+		}
+	}
 	if (len(st.Resources) == 0) == (len(st.NotResources) == 0) {
 		return Statement{}, errors.New("exactly one of Resource and NotResource is required")
 	}
 	for _, a := range append(append([]string(nil), st.Actions...), st.NotActions...) {
-		if a != "*" && !strings.HasPrefix(strings.ToLower(a), "s3:") {
-			return Statement{}, fmt.Errorf("action %q: only s3:* actions are supported", a)
+		la := strings.ToLower(a)
+		// s3:* are the S3 API actions; admin:* (MinIO's names, used by the
+		// /minio/admin/v3 API) and nanoio:* are the admin actions that a
+		// policy may delegate to a non-root user or service account.
+		if a != "*" && !strings.HasPrefix(la, "s3:") && !strings.HasPrefix(la, "nanoio:") &&
+			!strings.HasPrefix(la, "admin:") && !strings.HasPrefix(la, "kms:") && !strings.HasPrefix(la, "sts:") {
+			return Statement{}, fmt.Errorf("action %q: only s3:*, admin:*, kms:*, sts:* and nanoio:* actions are supported", a)
 		}
 		if a == "" || strings.ContainsAny(a, " \t") {
 			return Statement{}, fmt.Errorf("action %q is malformed", a)
@@ -367,7 +417,15 @@ func (st *Statement) matches(req Request, username string) bool {
 		return false
 	}
 	arn := req.ARN()
-	if len(st.Resources) > 0 {
+	if st.LiteralResources {
+		ok := false
+		for _, r := range st.Resources {
+			ok = ok || r == arn
+		}
+		if !ok {
+			return false
+		}
+	} else if len(st.Resources) > 0 {
 		if !hit(st.Resources, arn, false) {
 			return false
 		}
@@ -375,7 +433,7 @@ func (st *Statement) matches(req Request, username string) bool {
 		return false
 	}
 	for _, c := range st.Conditions {
-		if !c.holds(req.Context, username) {
+		if !c.holds(req, username) {
 			return false
 		}
 	}
@@ -384,8 +442,11 @@ func (st *Statement) matches(req Request, username string) bool {
 
 // holds evaluates one condition. A key absent from the request context
 // makes positive operators false and negated operators true, as in AWS.
-func (c Condition) holds(ctx map[string]string, username string) bool {
-	val, present := ctx[c.Key]
+func (c Condition) holds(req Request, username string) bool {
+	val, present := req.Context[c.Key]
+	if !present && req.Lookup != nil {
+		val, present = req.Lookup(c.Key)
+	}
 	if c.Key == "aws:username" && !present {
 		val, present = username, true
 	}
@@ -454,6 +515,192 @@ func (p *Policy) Evaluate(req Request, username string) (allow, deny bool) {
 	for i := range p.Statements {
 		st := &p.Statements[i]
 		if !st.matches(req, username) {
+			continue
+		}
+		if st.Allow {
+			allow = true
+		} else {
+			deny = true
+		}
+	}
+	return allow, deny
+}
+
+// PrincipalARNPrefix is how NanoIO names its identities: the single tenant is
+// "nanoio", a user is its access key, and the root credential is "root".
+const PrincipalARNPrefix = "arn:aws:iam::nanoio:"
+
+// parsePrincipals decodes a Principal value: "*", {"AWS": "*"}, or
+// {"AWS": [...]} with ARNs of the forms arn:aws:iam::nanoio:user/<access key>
+// and arn:aws:iam::nanoio:root, or a bare access key. Wildcards are allowed.
+// Other principal types and other accounts are rejected: they could never
+// match, and a statement that silently never applies is a trap.
+func parsePrincipals(raw json.RawMessage) ([]string, error) {
+	raw = bytes.TrimSpace(raw)
+	var list []string
+	switch {
+	case len(raw) > 0 && raw[0] == '"':
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, err
+		}
+		if s != "*" {
+			return nil, errors.New(`a string Principal must be "*"; name users as {"AWS": ...}`)
+		}
+		return []string{"*"}, nil
+	case len(raw) > 0 && raw[0] == '{':
+		var m map[string]stringList
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("Principal: %w", err)
+		}
+		for k := range m {
+			if k != "AWS" {
+				return nil, fmt.Errorf("Principal type %q is not supported (only AWS)", k)
+			}
+		}
+		list = m["AWS"]
+	default:
+		return nil, errors.New("Principal must be \"*\" or an object")
+	}
+	if len(list) == 0 {
+		return nil, errors.New("Principal has no values")
+	}
+	for _, p := range list {
+		switch {
+		case p == "*":
+		case strings.HasPrefix(p, "arn:"):
+			if !strings.HasPrefix(p, PrincipalARNPrefix) {
+				return nil, fmt.Errorf("principal %q: only %s... principals exist here", p, PrincipalARNPrefix)
+			}
+			rest := strings.TrimPrefix(p, PrincipalARNPrefix)
+			if rest != "root" && !(strings.HasPrefix(rest, "user/") && len(rest) > len("user/")) {
+				return nil, fmt.Errorf("principal %q: use %suser/<access key> or %sroot", p, PrincipalARNPrefix, PrincipalARNPrefix)
+			}
+		case p == "" || strings.ContainsAny(p, ":/ \t"):
+			return nil, fmt.Errorf("principal %q is malformed", p)
+		}
+		if strings.Contains(p, "${") {
+			return nil, fmt.Errorf("principal %q: policy variables are not allowed in a Principal", p)
+		}
+	}
+	return list, nil
+}
+
+// Principal is who a request is made by, for a resource policy.
+type Principal struct {
+	// AccessKey is empty for an anonymous request.
+	AccessKey string
+	Anonymous bool
+	// Root is the root credential.
+	Root bool
+}
+
+func (p Principal) names() []string {
+	switch {
+	case p.Anonymous:
+		return nil
+	case p.Root:
+		return []string{PrincipalARNPrefix + "root", p.AccessKey}
+	}
+	return []string{PrincipalARNPrefix + "user/" + p.AccessKey, p.AccessKey}
+}
+
+// principalMatches reports whether the statement's Principal / NotPrincipal
+// admits who. NotPrincipal "*" admits nobody.
+func (st *Statement) principalMatches(who Principal) bool {
+	if st.AuthenticatedOnly && who.Anonymous {
+		return false
+	}
+	in := func(list []string) bool {
+		for _, pat := range list {
+			if pat == "*" {
+				return true
+			}
+			for _, n := range who.names() {
+				if st.LiteralPrincipals {
+					if pat == n {
+						return true
+					}
+				} else if glob(substitute(pat, who.AccessKey), n, false) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if st.NotPrincipals != nil {
+		return !in(st.NotPrincipals)
+	}
+	return in(st.Principals)
+}
+
+// BucketPolicy is a parsed resource-based policy attached to one bucket.
+type BucketPolicy struct {
+	ID         string
+	Statements []Statement
+}
+
+// MaxBucketPolicySize is S3's limit.
+const MaxBucketPolicySize = 20 << 10
+
+// ParseBucketPolicy parses a bucket policy document. In addition to the
+// identity-policy rules it requires a Principal in every statement and that
+// every Resource names the bucket or its objects (a policy cannot grant
+// access to anything else).
+func ParseBucketPolicy(data []byte, bucket string) (*BucketPolicy, error) {
+	if len(data) > MaxBucketPolicySize {
+		return nil, fmt.Errorf("policy: document is %d bytes; the limit is %d", len(data), MaxBucketPolicySize)
+	}
+	var raw struct {
+		Version   string          `json:"Version"`
+		ID        string          `json:"Id"`
+		Statement json.RawMessage `json:"Statement"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return nil, fmt.Errorf("policy: %w", err)
+	}
+	if dec.More() {
+		return nil, errors.New("policy: trailing data after the document")
+	}
+	if raw.Version != "2012-10-17" && raw.Version != "2008-10-17" {
+		return nil, fmt.Errorf("policy: Version must be 2012-10-17 or 2008-10-17, got %q", raw.Version)
+	}
+	var stmts []json.RawMessage
+	if b := bytes.TrimSpace(raw.Statement); len(b) > 0 && b[0] == '[' {
+		if err := json.Unmarshal(b, &stmts); err != nil {
+			return nil, fmt.Errorf("policy: Statement: %w", err)
+		}
+	} else if len(b) > 0 {
+		stmts = []json.RawMessage{b}
+	}
+	if len(stmts) == 0 {
+		return nil, errors.New("policy: Statement is required and must not be empty")
+	}
+	p := &BucketPolicy{ID: raw.ID}
+	for i, sb := range stmts {
+		st, err := parseStatement(sb, true)
+		if err != nil {
+			return nil, fmt.Errorf("policy: statement %d: %w", i, err)
+		}
+		for _, res := range append(append([]string(nil), st.Resources...), st.NotResources...) {
+			base := "arn:aws:s3:::" + bucket
+			if res != base && !strings.HasPrefix(res, base+"/") {
+				return nil, fmt.Errorf("policy: statement %d: resource %q is not bucket %q or one of its objects", i, res, bucket)
+			}
+		}
+		p.Statements = append(p.Statements, st)
+	}
+	return p, nil
+}
+
+// Evaluate applies the policy to a request by who: explicit Deny and Allow
+// of the statements whose principal, action, resource and conditions match.
+func (p *BucketPolicy) Evaluate(req Request, who Principal) (allow, deny bool) {
+	for i := range p.Statements {
+		st := &p.Statements[i]
+		if !st.principalMatches(who) || !st.matches(req, who.AccessKey) {
 			continue
 		}
 		if st.Allow {

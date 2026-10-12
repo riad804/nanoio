@@ -111,13 +111,18 @@ func (s *Store) moveObject(ctx context.Context, from int, bucket string, o stora
 	}
 	rc, info, err := s.sets[from].GetObject(ctx, bucket, o.Name, storage.GetOptions{})
 	if err != nil {
+		if errors.Is(err, storage.ErrTransitioned) {
+			// Its data is in a tier; there is nothing to copy and the stub
+			// cannot be re-created on another set yet.
+			return false, 0, fmt.Errorf("%s/%s is transitioned to a remote tier and cannot be drained", bucket, o.Name)
+		}
 		if errors.Is(err, storage.ErrObjectNotFound) {
 			return false, 0, nil // deleted meanwhile
 		}
 		return false, 0, err
 	}
 	defer rc.Close()
-	opts := storage.PutOptions{ContentType: info.ContentType, UserDefined: info.UserDefined, IfNoneMatch: "*"}
+	opts := storage.PutOptions{ContentType: info.ContentType, UserDefined: info.UserDefined, IfNoneMatch: "*", StorageClass: info.StorageClass}
 	var put storage.ObjectInfo
 	if len(info.Parts) > 1 {
 		// A multipart object moves as a multipart object, part for part:
@@ -153,7 +158,7 @@ func (s *Store) moveObject(ctx context.Context, from int, bucket string, o stora
 // parts and the same composite ETag.
 func (s *Store) movePartwise(ctx context.Context, dst int, bucket, object string, rc io.Reader, info storage.ObjectInfo, opts storage.PutOptions) (storage.ObjectInfo, error) {
 	set := s.sets[dst]
-	id, err := set.NewMultipartUpload(ctx, bucket, object, storage.PutOptions{ContentType: opts.ContentType, UserDefined: opts.UserDefined})
+	id, err := set.NewMultipartUpload(ctx, bucket, object, storage.PutOptions{ContentType: opts.ContentType, UserDefined: opts.UserDefined, StorageClass: opts.StorageClass})
 	if err != nil {
 		return storage.ObjectInfo{}, err
 	}

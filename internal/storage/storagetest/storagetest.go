@@ -171,9 +171,11 @@ func Run(t *testing.T, newBackend Factory) {
 		{"MultipartListing", testMultipartListing},
 		{"MultipartConcurrency", testMultipartConcurrency},
 		{"VersioningState", testVersioningState},
+		{"ImportVersions", testImport},
 		{"UpdateMetadata", testUpdateMetadata},
 		{"UpdateMetadataMultipartAndVersions", testUpdateMetadataMultipartAndVersions},
 		{"PutFinalize", testPutFinalize},
+		{"StorageClassValidation", testStorageClassValidation},
 		{"Closed", testClosed},
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, newBackend) })

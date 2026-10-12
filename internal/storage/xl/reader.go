@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/klauspost/reedsolomon"
+
 	"nanoio/internal/meta"
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/xl/disk"
@@ -34,6 +36,7 @@ type objectReader struct {
 	starts         []int64 // part start offsets
 	blockSize      int64
 	k, m           int
+	enc            reedsolomon.Encoder
 	size, pos      int64
 
 	files   []disk.Shard // per shard index, for curPart
@@ -54,14 +57,19 @@ type objectReader struct {
 // until the reader is closed.
 func (x *XL) newObjectReader(ctx context.Context, bucket, object string, st *objState, v *meta.Version) (*objectReader, error) {
 	e := v.Erasure
-	if e == nil || e.DataBlocks != x.k || e.ParityBlocks != x.m || e.BlockSize <= 0 {
-		return nil, storage.Wrap(fmt.Errorf("%w: object was written with a different erasure layout", storage.ErrCorrupted), bucket, object)
+	if e == nil || e.ParityBlocks < 1 || e.DataBlocks < e.ParityBlocks ||
+		e.DataBlocks+e.ParityBlocks != len(x.drives) || e.BlockSize <= 0 {
+		return nil, storage.Wrap(fmt.Errorf("%w: object was written with an incompatible erasure layout", storage.ErrCorrupted), bucket, object)
+	}
+	enc, err := x.encoder(e.DataBlocks, e.ParityBlocks)
+	if err != nil {
+		return nil, err
 	}
 	r := &objectReader{
-		x: x, ctx: ctx, bucket: bucket, object: object, ver: v,
-		byShard: make([]*drive, x.k+x.m),
-		dataDir: v.DataDir, parts: v.Parts, blockSize: e.BlockSize, k: x.k, m: x.m, size: v.Size,
-		files: make([]disk.Shard, x.k+x.m), curPart: -1, blkPart: -1, blkIdx: -1,
+		x: x, ctx: ctx, bucket: bucket, object: object, ver: v, enc: enc,
+		byShard: make([]*drive, e.DataBlocks+e.ParityBlocks),
+		dataDir: v.DataDir, parts: v.Parts, blockSize: e.BlockSize, k: e.DataBlocks, m: e.ParityBlocks, size: v.Size,
+		files: make([]disk.Shard, e.DataBlocks+e.ParityBlocks), curPart: -1, blkPart: -1, blkIdx: -1,
 	}
 	if len(r.parts) == 0 {
 		r.parts = []meta.Part{{N: 1, Size: v.Size}}
@@ -295,7 +303,7 @@ func (r *objectReader) loadBlock(partIdx int, blockIdx int64) error {
 	}
 	for s := 0; s < r.k; s++ {
 		if shards[s] == nil {
-			if err := r.x.enc.ReconstructData(shards); err != nil {
+			if err := r.enc.ReconstructData(shards); err != nil {
 				return storage.Wrap(fmt.Errorf("%w: reconstruct: %v", storage.ErrCorrupted, err), r.bucket, r.object)
 			}
 			break

@@ -6,6 +6,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -272,12 +273,32 @@ type PutOptions struct {
 	// replaces it.
 	Retention Retention
 	LegalHold bool
+	// StorageClass selects the redundancy of the new object: "" and
+	// "STANDARD" are the backend's default; others are backend-specific
+	// (xl maps each class to a parity count). An unknown class is
+	// ErrInvalidStorageClass, and a backend with no redundancy options
+	// accepts only STANDARD.
+	StorageClass string
+	// Import, if set, stores the object as the version Import.VersionID
+	// with Import.ModTime instead of minting an ID and a time. It is how
+	// replication writes a replica: the bucket must be versioned, and
+	// importing a version that already exists changes nothing and returns
+	// it (so a retried replication is harmless). Not for multipart uploads.
+	Import *VersionImport
 	// Finalize, if set, is called by PutObject once the whole body has been
 	// read and verified and before the version is committed. The keys it
 	// returns are added to UserDefined. It is how a caller records a digest
 	// of data the backend never sees (the plaintext MD5 of an encrypted
 	// body). It is not used by multipart uploads.
 	Finalize func() map[string]string
+}
+
+// VersionImport names the identity of a replicated version.
+type VersionImport struct {
+	// VersionID is the source's version ID, in the API form: a UUID or
+	// NullVersionID.
+	VersionID string
+	ModTime   time.Time
 }
 
 // FinalUserDefined returns a copy of o.UserDefined with the keys of
@@ -329,6 +350,11 @@ type GetOptions struct {
 // nothing.
 type DeleteOptions struct {
 	VersionID string
+	// ImportMarker, if set (and VersionID empty), adds a delete marker with
+	// that ID and time instead of minting them: replication of a delete.
+	// The bucket must be versioned; a marker that already exists is left
+	// alone.
+	ImportMarker *VersionImport
 	// BypassGovernance allows removing a version under GOVERNANCE retention.
 	// See RetentionOptions.BypassGovernance.
 	BypassGovernance bool
@@ -385,7 +411,46 @@ type ObjectInfo struct {
 	// Retention and LegalHold are the version's object lock state.
 	Retention Retention
 	LegalHold bool
+	// StorageClass is "" for STANDARD, otherwise the class the object was
+	// written with.
+	StorageClass string
+	// Transition is non-nil for a version whose data has moved to a tier:
+	// the backend holds only a stub, and reading the data is the caller's
+	// job (GetObject returns a *TransitionedError).
+	Transition *TransitionInfo
 }
+
+// TransitionInfo says where a transitioned version's data lives.
+type TransitionInfo struct {
+	// Tier names the configured tier; Object and VersionID locate the data
+	// in it.
+	Tier      string
+	Object    string
+	VersionID string
+	Time      time.Time
+}
+
+// Transitioner is implemented by backends that can hold transitioned-object
+// stubs (xl and the cluster store; fs cannot).
+type Transitioner interface {
+	// TransitionObject records that the data of one version now lives at
+	// tr and releases the local data. It succeeds only if the version still
+	// has ETag ifETag (so a version rewritten since the data was uploaded is
+	// not turned into a stub of the wrong bytes) and is not already a stub.
+	TransitionObject(ctx context.Context, ref ObjectRef, tr TransitionInfo, ifETag string) (ObjectInfo, error)
+}
+
+// ErrTransitioned is the sentinel inside a *TransitionedError.
+var ErrTransitioned = errors.New("object data is in a remote tier")
+
+// TransitionedError is returned by GetObject for a stub: the caller reads
+// the data from Info.Transition.
+type TransitionedError struct {
+	Info ObjectInfo
+}
+
+func (e *TransitionedError) Error() string { return ErrTransitioned.Error() }
+func (e *TransitionedError) Unwrap() error { return ErrTransitioned }
 
 // ListOptions controls ListObjects and ListObjectVersions. Results are in
 // UTF-8 byte order, as S3 requires.

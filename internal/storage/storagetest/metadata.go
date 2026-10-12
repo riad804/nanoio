@@ -173,3 +173,26 @@ func testPutFinalize(t *testing.T, f Factory) {
 		t.Error("Finalize ran for a rejected body")
 	}
 }
+
+func testStorageClassValidation(t *testing.T, f Factory) {
+	h := newHarness(t, f)
+	h.mkbucket("classval")
+	for _, ok := range []string{"", "STANDARD"} {
+		info, err := h.be.PutObject(bg, "classval", "k"+ok, strings.NewReader("data"), 4, storage.PutOptions{StorageClass: ok})
+		if err != nil {
+			t.Fatalf("class %q: %v", ok, err)
+		}
+		if info.StorageClass != "" {
+			t.Errorf("class %q recorded as %q", ok, info.StorageClass)
+		}
+	}
+	for _, bad := range []string{"NO_SUCH_CLASS_XYZ", "standard"} {
+		_, err := h.be.PutObject(bg, "classval", "bad", strings.NewReader("data"), 4, storage.PutOptions{StorageClass: bad})
+		wantErr(t, "PutObject class "+bad, err, storage.ErrInvalidStorageClass)
+		_, err = h.be.NewMultipartUpload(bg, "classval", "bad", storage.PutOptions{StorageClass: bad})
+		wantErr(t, "NewMultipartUpload class "+bad, err, storage.ErrInvalidStorageClass)
+	}
+	if _, err := h.be.StatObject(bg, "classval", "bad", storage.GetOptions{}); err == nil {
+		t.Error("a refused write left an object")
+	}
+}

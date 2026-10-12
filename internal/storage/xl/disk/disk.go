@@ -93,6 +93,9 @@ const (
 	OpSetLock
 	// OpSetMeta applies Meta to the object version VersionID in place.
 	OpSetMeta
+	// OpTransition turns the object version VersionID into a stub
+	// pointing at Transition and removes its data directory.
+	OpTransition
 )
 
 // BucketSettings is what a drive's bucket marker records: the versioning
@@ -133,6 +136,8 @@ type CommitRequest struct {
 	Lock *meta.Lock
 	// Meta is the change OpSetMeta applies.
 	Meta *meta.MetaUpdate
+	// Transition is the stub OpTransition installs.
+	Transition *meta.Transition
 	// Guard says how object lock is judged: the time to judge retention
 	// against, and whether governance retention may be bypassed. The
 	// caller sets Now once so every drive decides alike; zero means the

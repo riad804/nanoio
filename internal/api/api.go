@@ -12,6 +12,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -21,15 +22,22 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"nanoio/internal/auth"
+	"nanoio/internal/batch"
+	"nanoio/internal/event"
 	"nanoio/internal/iam"
 	"nanoio/internal/kms"
+	"nanoio/internal/lifecycle"
 	"nanoio/internal/storage"
+	"nanoio/internal/tier"
 )
 
 // Authenticator verifies who sent a request. *auth.Verifier implements it.
@@ -43,8 +51,23 @@ type Authorizer interface {
 	Allowed(accessKey string, req iam.Request) bool
 }
 
+// Decider is an Authorizer that reports its decision in parts, so the API
+// can combine it with a bucket's resource policy: explicit Deny anywhere
+// wins, then an Allow from either, otherwise deny. root marks the
+// credential no policy can restrict. *iam.Store implements it; an
+// Authorizer that does not is treated as having no explicit Deny.
+type Decider interface {
+	Decide(accessKey string, req iam.Request) (allow, deny, root bool)
+}
+
 // Options configures New.
 type Options struct {
+	// STSAuth verifies signed STS requests (signed for service "sts"). Nil
+	// means Auth is used.
+	STSAuth Authenticator
+	// Maintenance backs heal, scan and pool administration (optional; the
+	// operations report themselves unavailable without it).
+	Maintenance Maintainer
 	// Storage is the backend. Required.
 	Storage storage.StorageAPI
 	// Auth and Authz are required unless InsecureNoAuth is set.
@@ -81,6 +104,33 @@ type Options struct {
 	// TLS. Off by default; for development and for deployments where a
 	// trusted proxy terminates TLS.
 	AllowInsecureSSEC bool
+
+	// Events receives bucket events and delivers them to notification
+	// targets. New starts it (it must not be started already) and the
+	// caller closes it after the server has stopped. Nil disables
+	// notifications: no events are produced and only an empty notification
+	// configuration is accepted.
+	Events *event.Manager
+	// EventLocker, with Events, replicates the notification queues in the
+	// backend: queued events are written to the system bucket (quorum,
+	// erasure-coded) and delivered by whichever node holds the cluster
+	// lock for the target. Set it in cluster mode only. EventNodeID names
+	// this node in the stored objects and must be unique in the cluster.
+	EventLocker storage.Locker
+	EventNodeID string
+
+	// Lifecycle, when set, runs the lifecycle scanner in the background.
+	Lifecycle *LifecycleOptions
+	// Tier configures transitions to remote tiers (all optional).
+	Tier *TierOptions
+	// Batch, when set, runs the batch-job runner on this node.
+	Batch *BatchOptions
+	// Replication, when set, runs bucket replication on this node.
+	Replication *ReplicationOptions
+	// IAM, when set (it must be the store Authz uses), enables runtime
+	// users, groups and policies through the admin API, kept in the system
+	// bucket on top of the store's static file.
+	IAM *iam.Store
 }
 
 // InternalPrefix is the reserved internal namespace.
@@ -100,7 +150,34 @@ type Server struct {
 	kms               kms.KMS
 	defaultKey        string
 	allowInsecureSSEC bool
-	encCache          encConfigCache
+	conf              confCache
+	events            *event.Manager
+	lc                *lifecycle.Scanner
+	stop              []context.CancelFunc
+	bg                sync.WaitGroup
+	tiers             *tier.Manager
+	tcache            *tier.Cache
+	tierTTL           time.Duration
+	janitor           *tier.Janitor
+	batch             *batch.Manager
+	nodeID            string
+	iam               *iam.Store
+	iamrt             *iamRuntime
+	repl              *replEngine
+	site              *siteRuntime
+	siteLocker        storage.Locker
+	clusterIDv        atomic.Pointer[string]
+	maint             Maintainer
+	stsAuth           Authenticator
+	idp               idpState
+	idpMu             sync.Mutex
+	logins            loginLimiter
+	traces            traceBus
+	logs              logRing
+	healJobs          healJobs
+	decom             decomState
+	cfgOnce           sync.Once
+	cfgrt             *configRuntime
 }
 
 // New validates opts and returns the handler.
@@ -110,7 +187,8 @@ func New(opts Options) (*Server, error) {
 	}
 	s := &Server{st: opts.Storage, region: opts.Region, log: opts.Logger,
 		authn: opts.Auth, authz: opts.Authz, noAuth: opts.InsecureNoAuth, internal: opts.Internal,
-		kms: opts.KMS, defaultKey: opts.DefaultKMSKey, allowInsecureSSEC: opts.AllowInsecureSSEC}
+		kms: opts.KMS, defaultKey: opts.DefaultKMSKey, allowInsecureSSEC: opts.AllowInsecureSSEC,
+		events: opts.Events, maint: opts.Maintenance, stsAuth: opts.STSAuth}
 	if s.kms != nil && s.defaultKey == "" {
 		return nil, errors.New("api: Options.DefaultKMSKey is required with Options.KMS")
 	}
@@ -123,12 +201,45 @@ func New(opts Options) (*Server, error) {
 	if s.log == nil {
 		s.log = slog.Default()
 	}
+	host, _ := os.Hostname()
+	s.log = slog.New(&ringHandler{inner: s.log.Handler(), ring: &s.logs, node: host})
 	for _, d := range opts.Domains {
 		d = strings.ToLower(strings.Trim(strings.TrimSpace(d), "."))
 		if d == "" || strings.ContainsAny(d, "/: ") {
 			return nil, errors.New("api: invalid domain " + strconv.Quote(d))
 		}
 		s.domains = append(s.domains, d)
+	}
+	if err := s.initTiers(opts.Tier); err != nil {
+		return nil, err
+	}
+	if s.events != nil {
+		if opts.EventLocker != nil {
+			if opts.EventNodeID == "" {
+				return nil, errors.New("api: Options.EventNodeID is required with Options.EventLocker")
+			}
+			s.events.SetShared(&eventStore{st: s.st, locker: opts.EventLocker}, opts.EventNodeID)
+		}
+		s.events.Start(s.notifyConfig)
+	}
+	s.nodeID = opts.EventNodeID
+	s.initIAM(opts.IAM)
+	if opts.Lifecycle != nil {
+		if err := s.startLifecycle(opts.Lifecycle); err != nil {
+			return nil, err
+		}
+	}
+	if opts.Replication != nil {
+		if err := s.startReplication(opts.Replication); err != nil {
+			return nil, err
+		}
+		s.siteLocker = opts.Replication.Locker
+		s.initSite(opts.Replication)
+	}
+	if opts.Batch != nil {
+		if err := s.startBatch(opts.Batch); err != nil {
+			return nil, err
+		}
 	}
 	return s, nil
 }
@@ -145,6 +256,8 @@ type request struct {
 	who string
 	// res is the authentication result: payload hash and chunk signer.
 	res *auth.Result
+	// anon is set for a request that carried no credentials.
+	anon bool
 }
 
 // statusWriter records the status and body size for access logging and
@@ -181,9 +294,15 @@ func newRequestID() string {
 
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == InternalPrefix+"admin/rewrap" {
+	if adminRoutes[strings.TrimPrefix(r.URL.Path, InternalPrefix)] {
 		s.serveAdmin(w, r)
 		return
+	}
+	if isMadmin(r.URL.Path) {
+		if _, vhost := s.hostBucket(r.Host); !vhost {
+			s.serveMadmin(w, r)
+			return
+		}
 	}
 	if s.internal != nil && strings.HasPrefix(r.URL.Path, InternalPrefix) {
 		if _, vhost := s.hostBucket(r.Host); !vhost {
@@ -214,16 +333,43 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.log.Debug("request", "id", q.id, "method", r.Method, "path", r.URL.Path,
 			"status", sw.status, "bytes", sw.bytes, "dur", time.Since(start))
+		if s.traces.active() {
+			s.publishTrace(traceS3, "s3."+r.Method, r, sw.status, r.ContentLength, sw.bytes, start, sw.Header())
+		}
 	}()
 
-	q.bucket, q.key = s.target(r.Host, r.URL.Path)
-	if !s.noAuth {
-		res, err := s.authn.Authenticate(r)
-		if err != nil {
-			s.fail(q, err)
+	if isSTSRequest(r) {
+		if _, vhost := s.hostBucket(r.Host); !vhost {
+			s.serveSTS(sw, r)
 			return
 		}
-		q.who, q.res = res.AccessKey, res
+	}
+	q.bucket, q.key = s.target(r.Host, r.URL.Path)
+	if q.bucket != sysBucket {
+		if isPreflight(r) {
+			s.preflight(q)
+			return
+		}
+		s.applyCORS(q)
+	}
+	if !s.noAuth {
+		res, err := s.authn.Authenticate(r)
+		switch {
+		case errors.Is(err, auth.ErrAnonymous):
+			// No credentials at all: the request is anonymous and may be
+			// served only if the bucket's policy allows it. A request that
+			// carries credentials which fail is never downgraded to this.
+			q.anon = true
+		case err != nil:
+			s.fail(q, err)
+			return
+		default:
+			if err := s.sessionOK(r, res.AccessKey); err != nil {
+				s.fail(q, err)
+				return
+			}
+			q.who, q.res = res.AccessKey, res
+		}
 	}
 	if q.bucket == sysBucket {
 		// NanoIO's own configuration bucket is not part of the S3 namespace.
@@ -244,6 +390,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// adminRoutes are the paths (under InternalPrefix) this server answers
+// itself; any other path in the namespace belongs to the internal handler.
+var adminRoutes = map[string]bool{
+	"admin/rewrap": true, "admin/events": true,
+	"admin/notify/targets": true, "admin/notify/dead": true, "admin/notify/requeue": true,
+	"admin/tier": true, "admin/tier/check": true,
+	"admin/batch/start": true, "admin/batch/list": true, "admin/batch/describe": true,
+	"admin/batch/cancel": true, "admin/batch/template": true,
+	"admin/iam/user": true, "admin/iam/group": true, "admin/iam/policy": true,
+	"admin/replication/target": true, "admin/replication/metrics": true, "admin/replication/resync": true,
+	"admin/site/info": true, "admin/site/add": true, "admin/site/issue": true, "admin/site/peer": true,
+	"admin/site/remove": true, "admin/site/status": true, "admin/site/apply": true, "admin/site/state": true,
+	"admin/site/resync": true,
+}
+
 // serveAdmin authenticates an admin request with the ordinary S3
 // credentials, then dispatches it.
 func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request) {
@@ -253,13 +414,47 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request) {
 	sw.Header().Set("x-amz-request-id", q.id)
 	if !s.noAuth {
 		res, err := s.authn.Authenticate(r)
+		if err == nil {
+			err = s.sessionOK(r, res.AccessKey)
+		}
 		if err != nil {
 			s.fail(q, err)
 			return
 		}
 		q.who, q.res = res.AccessKey, res
 	}
-	s.adminRewrap(sw, r, q)
+	switch strings.TrimPrefix(r.URL.Path, InternalPrefix+"admin/") {
+	case "rewrap":
+		s.adminRewrap(sw, r, q)
+	case "events":
+		s.adminEvents(q)
+	case "notify/targets":
+		s.adminNotifyTargets(q)
+	case "notify/dead":
+		s.adminNotifyDead(q)
+	case "notify/requeue":
+		s.adminNotifyRequeue(q)
+	case "tier":
+		s.adminTier(q)
+	case "tier/check":
+		s.adminTierCheck(q)
+	case "site/info", "site/add", "site/issue", "site/peer", "site/remove", "site/status", "site/apply", "site/state", "site/resync":
+		s.adminSite(q, strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, InternalPrefix), "admin/site/"))
+	case "replication/target":
+		s.adminReplTarget(q)
+	case "replication/metrics":
+		s.adminReplMetrics(q)
+	case "replication/resync":
+		s.adminReplResync(q)
+	case "iam/user":
+		s.adminIAM(q, "user")
+	case "iam/group":
+		s.adminIAM(q, "group")
+	case "iam/policy":
+		s.adminIAM(q, "policy")
+	case "batch/start", "batch/list", "batch/describe", "batch/cancel", "batch/template":
+		s.adminBatch(q, strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, InternalPrefix), "admin/batch/"))
+	}
 }
 
 // target resolves the bucket and key of a request. A Host that is a
@@ -348,27 +543,6 @@ func (s *Server) writeXML(q *request, status int, v any) {
 	q.w.Write(buf.Bytes())
 }
 
-// authorize checks that the caller may perform action on bucket/key before
-// the handler does any work. ctx carries condition keys such as s3:prefix.
-// It returns false after writing AccessDenied.
-func (s *Server) authorize(q *request, action, bucket, key string, ctx map[string]string) bool {
-	if s.noAuth {
-		return true
-	}
-	if ctx == nil {
-		ctx = map[string]string{}
-	}
-	ctx["aws:sourceip"] = remoteIP(q.r)
-	ctx["aws:securetransport"] = strconv.FormatBool(q.r.TLS != nil)
-	req := iam.Request{Action: action, Bucket: bucket, Key: key, Context: ctx}
-	if s.authz.Allowed(q.who, req) {
-		return true
-	}
-	s.log.Info("access denied", "id", q.id, "user", q.who, "action", action, "resource", req.ARN())
-	s.fail(q, errAccessDenied)
-	return false
-}
-
 // remoteIP is the TCP peer address. X-Forwarded-For is deliberately not
 // trusted: any client can set it.
 func remoteIP(r *http.Request) string {
@@ -401,17 +575,17 @@ func (q *request) firstOf(names []string) string {
 // must not create a bucket).
 var (
 	bucketSubresources = []string{
-		"accelerate", "acl", "analytics", "cors", "intelligent-tiering",
-		"inventory", "lifecycle", "logging", "metrics", "notification",
-		"policy", "policyStatus", "publicAccessBlock", "replication", "requestPayment",
-		"tagging", "website", "ownershipControls",
+		"accelerate", "analytics", "intelligent-tiering",
+		"inventory", "logging", "metrics",
+		"policyStatus", "publicAccessBlock", "requestPayment",
+		"website", "ownershipControls",
 	}
 	// partNumber is listed because GET ?partNumber=N (read one part of a
 	// finished object) is not implemented; PUT ?partNumber&uploadId is
 	// routed to UploadPart before this check.
 	objectSubresources = []string{
-		"acl", "attributes", "partNumber", "restore",
-		"select", "tagging", "torrent",
+		"attributes", "partNumber",
+		"select", "torrent",
 	}
 )
 
@@ -451,6 +625,27 @@ func (s *Server) bucketOp(q *request) {
 	case q.has("encryption"):
 		s.bucketEncryptionOp(q)
 		return
+	case q.has("policy"):
+		s.bucketPolicyOp(q)
+		return
+	case q.has("acl"):
+		s.bucketACLOp(q)
+		return
+	case q.has("cors"):
+		s.bucketCORSOp(q)
+		return
+	case q.has("tagging"):
+		s.bucketTaggingOp(q)
+		return
+	case q.has("notification"):
+		s.bucketNotificationOp(q)
+		return
+	case q.has("lifecycle"):
+		s.bucketLifecycleOp(q)
+		return
+	case q.has("replication"):
+		s.bucketReplicationOp(q)
+		return
 	case q.has("versioning"):
 		switch m {
 		case http.MethodPut:
@@ -463,6 +658,10 @@ func (s *Server) bucketOp(q *request) {
 		return
 	}
 	if sub := q.firstOf(bucketSubresources); sub != "" {
+		if q.anon {
+			s.fail(q, errAccessDenied) // nothing anonymous reaches a feature that has no policy action
+			return
+		}
 		s.fail(q, notImplemented("bucket subresource ?"+sub))
 		return
 	}
@@ -489,11 +688,27 @@ func (s *Server) objectOp(q *request) {
 		s.multipartOp(q)
 		return
 	}
+	if q.has("acl") {
+		s.objectACLOp(q)
+		return
+	}
+	if q.has("tagging") {
+		s.objectTaggingOp(q)
+		return
+	}
 	if sub := q.firstOf([]string{"retention", "legal-hold"}); sub != "" {
 		s.objectLockOp(q, sub)
 		return
 	}
+	if q.has("restore") {
+		s.restoreObject(q)
+		return
+	}
 	if sub := q.firstOf(objectSubresources); sub != "" {
+		if q.anon {
+			s.fail(q, errAccessDenied)
+			return
+		}
 		s.fail(q, notImplemented("object subresource ?"+sub))
 		return
 	}

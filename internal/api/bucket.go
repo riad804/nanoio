@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -11,7 +12,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"nanoio/internal/iam"
 	"nanoio/internal/storage"
 )
 
@@ -68,13 +68,35 @@ func (s *Server) createBucket(q *request) {
 			return
 		}
 	}
+	grants, hasACL, aerr := aclFromHeaders(q.r.Header)
+	if aerr != nil {
+		s.fail(q, aerr)
+		return
+	}
+	if hasACL && !s.authorize(q, "s3:PutBucketAcl", q.bucket, "", nil) {
+		return
+	}
 	if err := s.st.MakeBucket(q.r.Context(), q.bucket, storage.MakeBucketOptions{ObjectLock: lock}); err != nil {
 		s.fail(q, err)
 		return
 	}
 	// A configuration left by an earlier bucket of this name (a crash
 	// between its deletion and the removal of its settings) must not apply.
-	s.dropEncConfig(q.r.Context(), q.bucket)
+	s.confDropAll(siteApplying(q.r.Context()), q.bucket)
+	if len(grants) > 0 {
+		data, _ := json.Marshal(aclDoc{Grants: grants})
+		if err := s.confPut(q.r.Context(), q.bucket, confACL, data); err != nil {
+			s.log.Error("bucket created but its ACL could not be stored", "bucket", q.bucket, "err", err)
+		}
+	}
+	if s.siteEnabled(q.ctx()) {
+		// Buckets of a site-replication group are always versioned, which is
+		// what lets replicas keep their version IDs.
+		if err := s.st.SetBucketVersioning(q.ctx(), q.bucket, storage.VersioningEnabled); err != nil {
+			s.log.Warn("site: cannot enable versioning on a new bucket", "bucket", q.bucket, "err", err)
+		}
+		s.siteBucketChanged(q.ctx(), q.bucket, false)
+	}
 	q.w.Header().Set("Location", "/"+q.bucket)
 	q.w.WriteHeader(http.StatusOK)
 }
@@ -103,7 +125,8 @@ func (s *Server) deleteBucket(q *request) {
 		s.fail(q, err)
 		return
 	}
-	s.dropEncConfig(q.r.Context(), q.bucket)
+	s.confDropAll(siteApplying(q.r.Context()), q.bucket)
+	s.siteBucketChanged(q.ctx(), q.bucket, true)
 	q.w.WriteHeader(http.StatusNoContent)
 }
 
@@ -169,7 +192,7 @@ func (p listParams) contents(objs []storage.ObjectInfo, owner bool) []contentsEn
 	for _, o := range objs {
 		e := contentsEntry{
 			Key: p.enc(o.Name), LastModified: isoTime(o.ModTime),
-			ETag: `"` + o.ETag + `"`, Size: plainSize(o), StorageClass: "STANDARD",
+			ETag: `"` + o.ETag + `"`, Size: plainSize(o), StorageClass: storageClassOf(o),
 		}
 		if owner {
 			ow := placeholderOwner
@@ -327,6 +350,12 @@ func (s *Server) listObjectsV2(q *request) {
 // deleteObjects implements POST /bucket?delete (multi-object delete, used
 // by `aws s3 rm --recursive`).
 func (s *Server) deleteObjects(q *request) {
+	if q.anon && !s.noAuth {
+		// Anonymous bulk delete is not offered; per-key DELETE is.
+		s.log.Info("access denied", "id", q.id, "user", "(anonymous)", "action", "s3:DeleteObject", "resource", "arn:aws:s3:::"+q.bucket)
+		s.fail(q, errAccessDenied)
+		return
+	}
 	body, err := s.readBody(q, 4<<20)
 	if err != nil {
 		s.fail(q, err)
@@ -368,6 +397,7 @@ func (s *Server) deleteObjects(q *request) {
 			res.Errors = append(res.Errors, deleteError{Key: o.Key, Code: "AccessDenied", Message: "Access Denied."})
 			continue
 		}
+		tags := s.removalTags(q, o.Key, o.VersionID)
 		dr, err := s.st.DeleteObject(q.r.Context(), q.bucket, o.Key, storage.DeleteOptions{VersionID: o.VersionID, BypassGovernance: asked})
 		if err != nil {
 			s.logLockRefusal(q, "delete", err)
@@ -377,6 +407,10 @@ func (s *Server) deleteObjects(q *request) {
 			}
 			res.Errors = append(res.Errors, deleteError{Key: o.Key, Code: ae.Code, Message: ae.Message})
 			continue
+		}
+		s.notifyRemoval(q, o.Key, o.VersionID, dr, tags)
+		if o.VersionID == "" && dr.DeleteMarker {
+			s.replAfterMarker(q.ctx(), q.bucket, o.Key, dr.VersionID)
 		}
 		if !req.Quiet {
 			e := deletedEntry{Key: o.Key}
@@ -398,17 +432,11 @@ func (s *Server) deleteObjects(q *request) {
 // mayDelete authorises one key of a multi-object delete without writing a
 // response.
 func (s *Server) mayDelete(q *request, o deleteObject) bool {
-	if s.noAuth {
-		return true
-	}
 	action := "s3:DeleteObject"
 	if o.VersionID != "" {
 		action = "s3:DeleteObjectVersion"
 	}
-	return s.authz.Allowed(q.who, iam.Request{
-		Action: action, Bucket: q.bucket, Key: o.Key,
-		Context: map[string]string{"aws:sourceip": remoteIP(q.r), "aws:securetransport": strconv.FormatBool(q.r.TLS != nil)},
-	})
+	return s.allowed(q, action, q.bucket, o.Key)
 }
 
 // readBody reads at most limit bytes of a small request body (XML) and, if
@@ -509,7 +537,7 @@ func (s *Server) listObjectVersions(q *request) {
 		}
 		res.Entries = append(res.Entries, versionEntry{
 			Key: p.enc(v.Name), VersionID: vid, IsLatest: v.IsLatest, LastModified: isoTime(v.ModTime),
-			ETag: `"` + v.ETag + `"`, Size: plainSize(v), Owner: &owner, StorageClass: "STANDARD",
+			ETag: `"` + v.ETag + `"`, Size: plainSize(v), Owner: &owner, StorageClass: storageClassOf(v),
 		})
 	}
 	res.CommonPrefixes = p.prefixes(out.Prefixes)

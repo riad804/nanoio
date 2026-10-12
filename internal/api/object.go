@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"nanoio/internal/auth"
+	"nanoio/internal/event"
 	"nanoio/internal/kms"
+	"nanoio/internal/replication"
 	"nanoio/internal/sse"
 	"nanoio/internal/storage"
 )
@@ -51,9 +53,6 @@ type putRequest struct {
 // PutObject and CreateMultipartUpload.
 func parseObjectMeta(h http.Header) (storage.PutOptions, error) {
 	var opts storage.PutOptions
-	if h.Get("x-amz-tagging") != "" {
-		return opts, notImplemented("object tagging (x-amz-tagging)")
-	}
 	opts.ContentType = h.Get("Content-Type")
 
 	var encodings []string
@@ -182,7 +181,7 @@ func parsePut(r *http.Request, res *auth.Result) (*putRequest, error) {
 }
 
 func (s *Server) putObject(q *request) {
-	if !s.authorize(q, "s3:PutObject", q.bucket, q.key, nil) {
+	if !s.authorize(q, "s3:PutObject", q.bucket, q.key, writeContext(q.r.Header)) {
 		return
 	}
 	if q.r.Header.Get("x-amz-copy-source") != "" {
@@ -194,6 +193,7 @@ func (s *Server) putObject(q *request) {
 		s.fail(q, err)
 		return
 	}
+	p.opts.StorageClass = strings.TrimSpace(q.r.Header.Get("x-amz-storage-class"))
 	lock, aerr := parseLockHeaders(q.r.Header)
 	if aerr != nil {
 		s.fail(q, aerr)
@@ -203,6 +203,21 @@ func (s *Server) putObject(q *request) {
 		return
 	}
 	p.opts.Retention, p.opts.LegalHold = lock.retention, lock.hold
+	if !s.applyACLHeaders(q, &p.opts) || !s.applyTagHeader(q, &p.opts) {
+		return
+	}
+	ri, bad := s.replicaRequest(q)
+	if bad {
+		return
+	}
+	if ri != nil {
+		if err := s.applyReplica(ri, &p.opts); err != nil {
+			s.fail(q, invalidArgument(err.Error()))
+			return
+		}
+	} else {
+		p.opts.UserDefined = s.replPrepare(q.ctx(), q.bucket, q.key, p.opts.UserDefined)
+	}
 	spec, err := s.writeSpec(q, q.bucket)
 	if err != nil {
 		s.fail(q, err)
@@ -239,6 +254,15 @@ func (s *Server) putObject(q *request) {
 		setSSEHeaders(h, meta, ssecKeyMD5(spec))
 	}
 	q.w.WriteHeader(http.StatusOK)
+	psize := p.size
+	if psize < 0 {
+		psize = plainSize(info)
+	}
+	s.notify(q, event.ObjectCreatedPut, notifyObj{key: q.key, versionID: info.VersionID, etag: etag,
+		contentType: p.opts.ContentType, size: psize, modTime: info.ModTime, ud: p.opts.UserDefined})
+	if ri == nil {
+		s.replAfterPut(q.ctx(), q.bucket, q.key, info.VersionID, p.opts.UserDefined)
+	}
 }
 
 // ssecKeyMD5 is the base64 MD5 of an SSE-C spec's key, for response headers.
@@ -262,14 +286,28 @@ func (s *Server) deleteObject(q *request) {
 	if !ok {
 		return
 	}
-	res, err := s.st.DeleteObject(q.r.Context(), q.bucket, q.key, storage.DeleteOptions{
-		VersionID:        q.query.Get("versionId"),
-		BypassGovernance: bypass,
-	})
+	tags := s.removalTags(q, q.key, q.query.Get("versionId"))
+	dopts := storage.DeleteOptions{VersionID: q.query.Get("versionId"), BypassGovernance: bypass}
+	ri, rbad := s.replicaRequest(q)
+	if rbad {
+		return
+	}
+	if ri != nil && dopts.VersionID == "" {
+		if ri.versionID == "" || ri.modTime.IsZero() {
+			s.fail(q, invalidArgument("a replicated delete needs the source version ID and time"))
+			return
+		}
+		dopts.ImportMarker = &storage.VersionImport{VersionID: ri.versionID, ModTime: ri.modTime}
+	}
+	res, err := s.st.DeleteObject(q.r.Context(), q.bucket, q.key, dopts)
 	if err != nil {
 		s.logLockRefusal(q, "delete", err)
 		s.fail(q, err)
 		return
+	}
+	s.notifyRemoval(q, q.key, q.query.Get("versionId"), res, tags)
+	if ri == nil && res.DeleteMarker && q.query.Get("versionId") == "" {
+		s.replAfterMarker(q.ctx(), q.bucket, q.key, res.VersionID)
 	}
 	h := q.w.Header()
 	if res.VersionID != "" {
@@ -424,7 +462,7 @@ func (s *Server) getObject(q *request, head bool) {
 	if head {
 		info, err = s.st.StatObject(ctx, q.bucket, q.key, opts)
 	} else {
-		rc, info, err = s.st.GetObject(ctx, q.bucket, q.key, opts)
+		rc, info, err = s.openObject(ctx, q.bucket, q.key, opts)
 	}
 	if err != nil {
 		s.fail(q, err)
@@ -445,9 +483,29 @@ func (s *Server) getObject(q *request, head bool) {
 		size, alt = enc.size, enc.storedTag
 		info.Size, info.ETag = enc.size, enc.etag
 	}
+	delivered := false
+	defer func() {
+		if !delivered {
+			return
+		}
+		name := event.ObjectAccessedGet
+		if head {
+			name = event.ObjectAccessedHead
+		}
+		s.notifyAccess(q, name, notifyObj{key: q.key, versionID: info.VersionID, etag: info.ETag,
+			contentType: info.ContentType, size: size, ud: info.UserDefined})
+	}()
 
 	h := q.w.Header()
 	objectHeaders(h, info)
+	s.tagCountHeader(q, h, info.UserDefined, info.VersionID)
+	if info.StorageClass != "" {
+		h.Set("x-amz-storage-class", info.StorageClass)
+	}
+	s.restoreHeaders(h, info)
+	if rs := replication.ClientStatus(info.UserDefined[replication.StatusKey]); rs != "" {
+		h.Set("x-amz-replication-status", rs)
+	}
 	if enc != nil {
 		setSSEHeaders(h, enc.meta, enc.clientMD5)
 	}
@@ -471,6 +529,7 @@ func (s *Server) getObject(q *request, head bool) {
 	h.Set("Content-Length", strconv.FormatInt(length, 10))
 	q.w.WriteHeader(status)
 	if head || length == 0 {
+		delivered = true
 		return
 	}
 	var body io.Reader = rc
@@ -497,4 +556,5 @@ func (s *Server) getObject(q *request, head bool) {
 		s.log.Warn("response body truncated", "id", q.id, "bucket", q.bucket, "key", q.key, "err", err)
 		panic(http.ErrAbortHandler)
 	}
+	delivered = true
 }

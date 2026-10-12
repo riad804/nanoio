@@ -375,3 +375,58 @@ func TestKMSConfig(t *testing.T) {
 		t.Errorf("kes with api key: %v", err)
 	}
 }
+
+func TestNotifyConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string, mode os.FileMode) string {
+		p := filepath.Join(dir, name)
+		os.WriteFile(p, []byte(body), mode)
+		os.Chmod(p, mode)
+		return p
+	}
+	t.Run("targets and queue directory", func(t *testing.T) {
+		p := write("ok.json", `{"root":"/data","rootUser":"a","rootPassword":"b","notify":{"queueDir":"q","replayBytes":-1,
+			"targets":{"webhook":{"primary":{"endpoint":"http://h/"}},"kafka":{"audit":{"brokers":["h:9092"],"topic":"t"}}}}}`, 0o600)
+		c, err := Load(p, env(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Finalize(); err != nil {
+			t.Fatal(err)
+		}
+		if !filepath.IsAbs(c.Notify.QueueDir) || c.Notify.ReplayBytes != -1 || len(c.Notify.Targets["webhook"]) != 1 {
+			t.Errorf("notify = %+v", c.Notify)
+		}
+	})
+	for name, notify := range map[string]string{
+		"unknown type": `{"targets":{"sms":{"a":{}}}}`,
+		"bad id":       `{"targets":{"webhook":{"a b":{}}}}`,
+		"empty id":     `{"targets":{"webhook":{"":{}}}}`,
+		"not object":   `{"targets":{"webhook":{"a":"http://h/"}}}`,
+		"unknown key":  `{"queue":"x"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := write("bad.json", `{"root":"/data","rootUser":"a","rootPassword":"b","notify":`+notify+`}`, 0o600)
+			c, err := Load(p, env(nil))
+			if err == nil {
+				err = c.Finalize()
+			}
+			if err == nil {
+				t.Errorf("accepted %s", notify)
+			}
+		})
+	}
+	t.Run("queue dir from the environment", func(t *testing.T) {
+		c, err := Load("", env(map[string]string{EnvNotifyQueueDir: "/var/lib/nanoio/events"}))
+		if err != nil || c.Notify.QueueDir != "/var/lib/nanoio/events" {
+			t.Errorf("%+v, %v", c.Notify, err)
+		}
+	})
+	t.Run("loose permissions on a file holding a target secret warn", func(t *testing.T) {
+		p := write("loose.json", `{"root":"/d","notify":{"targets":{"webhook":{"p":{"endpoint":"http://h/","authToken":"Bearer topsecret"}}}}}`, 0o644)
+		c, err := Load(p, env(nil))
+		if err != nil || len(c.Warnings) != 1 || strings.Contains(c.Warnings[0], "topsecret") {
+			t.Errorf("warnings = %v, %v", c.Warnings, err)
+		}
+	})
+}

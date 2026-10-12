@@ -1,96 +1,37 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
-	"errors"
-	"io"
 	"net/http"
 	"strings"
-	"sync"
-	"time"
 
 	"nanoio/internal/kms"
 	"nanoio/internal/sse"
 	"nanoio/internal/storage"
 )
 
-// A bucket's default encryption is a small JSON document stored as an
-// ordinary object, "<bucket>/encryption", in the reserved bucket sysBucket.
-// It therefore gets the backend's quorum, healing and cluster placement
-// for free. The API never serves sysBucket to clients.
-const encConfigName = "/encryption"
-
-// encConfigTTL bounds how stale another node's change can be; a change made
-// through this node is visible at once.
-const encConfigTTL = 5 * time.Second
-
+// A bucket's default encryption is a small JSON document of kind
+// confEncryption (see bucketconf.go).
 type bucketEncConfig struct {
 	Algorithm string `json:"algorithm"` // "AES256" or "aws:kms"
 	KeyID     string `json:"keyId,omitempty"`
 }
 
-type encConfigEntry struct {
-	cfg     *bucketEncConfig
-	expires time.Time
-}
-
-type encConfigCache struct {
-	mu sync.Mutex
-	m  map[string]encConfigEntry
-}
-
-func (c *encConfigCache) get(b string) (*bucketEncConfig, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.m[b]
-	if !ok || time.Now().After(e.expires) {
-		return nil, false
-	}
-	return e.cfg, true
-}
-
-func (c *encConfigCache) put(b string, cfg *bucketEncConfig) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.m == nil {
-		c.m = map[string]encConfigEntry{}
-	}
-	c.m[b] = encConfigEntry{cfg, time.Now().Add(encConfigTTL)}
-}
-
-func (c *encConfigCache) drop(b string) {
-	c.mu.Lock()
-	delete(c.m, b)
-	c.mu.Unlock()
-}
-
 // loadEncConfig reads the bucket's default encryption, or nil.
 func (s *Server) loadEncConfig(ctx context.Context, bucket string) (*bucketEncConfig, error) {
-	if cfg, ok := s.encCache.get(bucket); ok {
-		return cfg, nil
-	}
-	rc, _, err := s.st.GetObject(ctx, sysBucket, bucket+encConfigName, storage.GetOptions{})
-	switch {
-	case errors.Is(err, storage.ErrObjectNotFound), errors.Is(err, storage.ErrBucketNotFound):
-		s.encCache.put(bucket, nil)
-		return nil, nil
-	case err != nil:
+	v, err := s.confParsed(ctx, bucket, confEncryption, func(b []byte) (any, error) {
+		var cfg bucketEncConfig
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			return nil, err
+		}
+		return &cfg, nil
+	})
+	if err != nil || v == nil {
 		return nil, err
 	}
-	defer rc.Close()
-	data, err := io.ReadAll(io.LimitReader(rc, 64<<10))
-	if err != nil {
-		return nil, err
-	}
-	var cfg bucketEncConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	s.encCache.put(bucket, &cfg)
-	return &cfg, nil
+	return v.(*bucketEncConfig), nil
 }
 
 // bucketDefaultSpec is the encryption a write with no SSE headers gets.
@@ -206,24 +147,11 @@ func (s *Server) putBucketEncryption(q *request) {
 		return
 	}
 	data, _ := json.Marshal(cfg)
-	if err := s.ensureSysBucket(q.ctx()); err != nil {
+	if err := s.confPut(q.ctx(), q.bucket, confEncryption, data); err != nil {
 		s.fail(q, err)
 		return
 	}
-	if _, err := s.st.PutObject(q.ctx(), sysBucket, q.bucket+encConfigName, bytes.NewReader(data), int64(len(data)), storage.PutOptions{}); err != nil {
-		s.fail(q, err)
-		return
-	}
-	s.encCache.drop(q.bucket)
 	q.w.WriteHeader(http.StatusOK)
-}
-
-func (s *Server) ensureSysBucket(ctx context.Context) error {
-	err := s.st.MakeBucket(ctx, sysBucket, storage.MakeBucketOptions{})
-	if err != nil && !errors.Is(err, storage.ErrBucketExists) {
-		return err
-	}
-	return nil
 }
 
 func (s *Server) getBucketEncryption(q *request) {
@@ -264,17 +192,8 @@ func (s *Server) deleteBucketEncryption(q *request) {
 		s.fail(q, err)
 		return
 	}
-	s.dropEncConfig(q.ctx(), q.bucket)
+	s.confDrop(q.ctx(), q.bucket, confEncryption)
 	q.w.WriteHeader(http.StatusNoContent)
-}
-
-// dropEncConfig removes a bucket's default encryption document, if any.
-func (s *Server) dropEncConfig(ctx context.Context, bucket string) {
-	_, err := s.st.DeleteObject(ctx, sysBucket, bucket+encConfigName, storage.DeleteOptions{})
-	if err != nil && !errors.Is(err, storage.ErrObjectNotFound) && !errors.Is(err, storage.ErrBucketNotFound) {
-		s.log.Warn("could not remove bucket encryption config", "bucket", bucket, "err", err)
-	}
-	s.encCache.drop(bucket)
 }
 
 var _ = kms.Zero

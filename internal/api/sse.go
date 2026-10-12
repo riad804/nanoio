@@ -114,7 +114,7 @@ func rejectSSEOnRead(h http.Header) *APIError {
 // rejectReservedHeaders refuses client headers in the internal namespace.
 func rejectReservedHeaders(h http.Header) *APIError {
 	for k := range h {
-		if sse.IsReserved(k) {
+		if strings.HasPrefix(strings.ToLower(k), internalPrefix) {
 			return invalidArgument("Header " + k + " is reserved.")
 		}
 	}

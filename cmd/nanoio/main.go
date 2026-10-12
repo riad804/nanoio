@@ -165,8 +165,12 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		if err != nil {
 			return err
 		}
-		apiOpts.Auth = &auth.Verifier{Provider: store, Region: cfg.Region}
+		apiOpts.Auth = &auth.Verifier{Provider: store, Region: cfg.Region, AllowSessionToken: true,
+			RegionlessPrefixes: []string{"/minio/admin/", "/minio/kms/"}}
+		apiOpts.STSAuth = &auth.Verifier{Provider: store, Region: cfg.Region, Service: "sts", AllowSessionToken: true,
+			RegionlessPrefixes: []string{"/"}}
 		apiOpts.Authz = store
+		apiOpts.IAM = store
 		logger.Info("authentication enabled", "root", cfg.RootUser, "users", store.UserCount(), "iamFile", cfg.IAMFile)
 	}
 
@@ -175,10 +179,27 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	} else if k != nil {
 		apiOpts.KMS, apiOpts.DefaultKMSKey = k, cfg.KMS.DefaultKey
 	}
+	events, err := newNotifier(cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer events.Close() // idempotent; the normal path closes it earlier, below
+	apiOpts.Events = events
 	apiOpts.AllowInsecureSSEC = cfg.AllowInsecureSSEC
 	if cfg.AllowInsecureSSEC {
 		logger.Warn("SSE-C keys are accepted over connections that are not TLS: an on-path observer can read them")
 	}
+
+	tierOpts, janitor, err := tierOptions(cfg, logger)
+	if err != nil {
+		return err
+	}
+	var onFreed func(bucket, object string, tr storage.TransitionInfo)
+	if janitor != nil {
+		onFreed = janitor.Freed
+		defer janitor.Close()
+	}
+	apiOpts.Tier = tierOpts
 
 	gcInterval := cfg.GCInterval.D()
 	if gcInterval == 0 {
@@ -189,14 +210,14 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	var node *cluster.Node
 	switch {
 	case cfg.Cluster != nil:
-		node, err = newClusterNode(cfg, gcInterval, logger)
+		node, err = newClusterNode(cfg, gcInterval, logger, onFreed)
 		if err != nil {
 			return err
 		}
 	case len(cfg.Drives) > 0:
 		x, err := xl.New(cfg.Drives, xl.Options{
-			Locker: locker, Logger: logger, ParityBlocks: cfg.Parity,
-			UploadExpiry: cfg.UploadExpiry.D(), ScanInterval: gcInterval,
+			Locker: locker, Logger: logger, ParityBlocks: cfg.Parity, StorageClasses: storageClasses(cfg),
+			UploadExpiry: cfg.UploadExpiry.D(), ScanInterval: gcInterval, OnTransitionFreed: onFreed,
 		})
 		if err != nil {
 			return err
@@ -209,6 +230,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 				"online", x.OnlineDrives(), "configured", len(cfg.Drives))
 		}
 		backend = x
+		apiOpts.Maintenance = xlMaintainer(x)
 	default:
 		f, err := fs.New(cfg.Root, fs.Options{
 			Locker: locker, Logger: logger,
@@ -226,17 +248,22 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		return backend.Close()
 	}
 	sw := &switchHandler{}
+	var closers []func() // stop the API's background work before the backend
 	if node != nil {
 		sw.internal = node.Handler()
 		apiOpts.Internal = sw.internal
 	} else {
 		apiOpts.Storage = backend
+		apiOpts.Lifecycle = lifecycleOptions(cfg, locker)
+		apiOpts.Batch = batchOptions(cfg, locker)
+		apiOpts.Replication = replicationOptions(cfg, locker)
 		handler, err := api.New(apiOpts)
 		if err != nil {
 			closeBackend()
 			return err
 		}
 		sw.set(handler)
+		closers = append(closers, handler.Close)
 	}
 	ln, err := net.Listen("tcp", cfg.Address)
 	if err != nil {
@@ -275,6 +302,13 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 			return err
 		}
 		apiOpts.Storage = store
+		apiOpts.Maintenance = clusterMaintainer(store)
+		// Queued notifications are replicated in the cluster's own storage
+		// and delivered by whichever node holds the target's lock.
+		apiOpts.EventLocker, apiOpts.EventNodeID = node.Locker(), cfg.Cluster.Node
+		apiOpts.Lifecycle = lifecycleOptions(cfg, node.Locker())
+		apiOpts.Batch = batchOptions(cfg, node.Locker())
+		apiOpts.Replication = replicationOptions(cfg, node.Locker())
 		handler, err := api.New(apiOpts)
 		if err != nil {
 			srv.Close()
@@ -282,6 +316,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 			return err
 		}
 		sw.set(handler)
+		closers = append(closers, handler.Close)
 		backend = store
 		for _, st := range store.Status() {
 			logger.Info("erasure set", "set", st.ID, "pool", st.Pool, "draining", st.Draining,
@@ -327,6 +362,15 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 			runErr = fmt.Errorf("shutdown: %w", err)
 		}
 	}
+	for _, c := range closers {
+		c()
+	}
+	// The server has stopped, so no request can publish any more: flush the
+	// events already published to their durable queues before the storage
+	// they may still need to consult goes away.
+	if err := events.Close(); err != nil && runErr == nil {
+		runErr = fmt.Errorf("shutdown: %w", err)
+	}
 	if err := closeBackend(); err != nil && runErr == nil {
 		runErr = fmt.Errorf("shutdown: %w", err)
 	}
@@ -365,7 +409,8 @@ func (h *switchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "node is starting", http.StatusServiceUnavailable)
 }
 
-func newClusterNode(cfg config.Config, gcInterval time.Duration, logger *slog.Logger) (*cluster.Node, error) {
+func newClusterNode(cfg config.Config, gcInterval time.Duration, logger *slog.Logger,
+	onFreed func(bucket, object string, tr storage.TransitionInfo)) (*cluster.Node, error) {
 	cl := cfg.Cluster
 	pools := make([]cluster.PoolSpec, len(cl.Pools))
 	for i, p := range cl.Pools {
@@ -377,11 +422,13 @@ func newClusterNode(cfg config.Config, gcInterval time.Duration, logger *slog.Lo
 	}
 	return cluster.NewNode(cluster.NodeConfig{
 		Self: cl.Node, Peers: cl.Nodes, Secrets: cl.Secrets, Pools: pools, Parity: cfg.Parity,
+		StorageClasses:    storageClasses(cfg),
 		TLS:               cluster.TLSFiles{Cert: cl.TLS.Cert, Key: cl.TLS.Key, CA: cl.TLS.CA},
 		InsecurePlaintext: !tlsRequired && len(cl.Nodes) > 1, Logger: logger,
 		LockTTL: cl.LockTTL.D(), LockTimeout: cfg.LockTimeout.D(), ListTimeout: cl.ListTimeout.D(),
 		AllowPartialList: cl.AllowPartialList, Heartbeat: cl.Heartbeat.D(), StragglerGrace: cl.StragglerGrace.D(),
 		UploadExpiry: cfg.UploadExpiry.D(), ScanInterval: gcInterval, StartupTimeout: cl.StartupTimeout.D(),
+		OnTransitionFreed: onFreed,
 	})
 }
 
@@ -393,9 +440,11 @@ func runAdmin(ctx context.Context, args []string, getenv func(string) string, st
 	target := flags.String("node", "", "node to call (default: the config's own node)")
 	pool := flags.Int("pool", -1, "decommission: pool index")
 	deep := flags.Bool("deep", false, "scan: verify every block's hash")
-	endpoint := flags.String("endpoint", "", "rewrap: base URL of the server (default: the config's address)")
+	endpoint := flags.String("endpoint", "", "rewrap, events, notify, requeue: base URL of the server (default: the config's address)")
+	var ev eventFlags
+	ev.register(flags)
 	if len(args) == 0 {
-		return errors.New("admin: need a command: status, scan, decommission or rewrap")
+		return errors.New("admin: need a command: status, scan, decommission, rewrap, events, notify, dead, requeue, tier-*, batch-*, replicate-*, site-* or iam-*-add|ls|rm")
 	}
 	cmd := args[0]
 	if err := flags.Parse(args[1:]); err != nil {
@@ -409,8 +458,16 @@ func runAdmin(ctx context.Context, args []string, getenv func(string) string, st
 	if err != nil {
 		return err
 	}
-	if cmd == "rewrap" {
+	switch cmd {
+	case "rewrap":
 		return runRewrap(ctx, cfg, *endpoint, stdout)
+	case "events", "notify", "dead", "requeue", "tier-add", "tier-ls", "tier-rm", "tier-check",
+		"batch-start", "batch-ls", "batch-describe", "batch-cancel", "batch-template",
+		"replicate-target-add", "replicate-target-ls", "replicate-target-rm", "replicate-resync", "replicate-resync-status",
+		"replicate-metrics", "site-add", "site-status", "site-remove", "site-resync",
+		"iam-user-add", "iam-user-ls", "iam-user-rm", "iam-group-add", "iam-group-ls", "iam-group-rm",
+		"iam-policy-add", "iam-policy-ls", "iam-policy-rm":
+		return runNotifyAdmin(ctx, cmd, cfg, *endpoint, ev, stdout)
 	}
 	cl := cfg.Cluster
 	if cl == nil || len(cl.Secrets) == 0 || len(cl.Nodes) == 0 {
@@ -464,4 +521,16 @@ func runAdmin(ctx context.Context, args []string, getenv func(string) string, st
 	enc := json.NewEncoder(stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+// storageClasses converts the configured classes to name -> parity.
+func storageClasses(cfg config.Config) map[string]int {
+	if len(cfg.StorageClasses) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(cfg.StorageClasses))
+	for name, sc := range cfg.StorageClasses {
+		out[name] = sc.Parity
+	}
+	return out
 }

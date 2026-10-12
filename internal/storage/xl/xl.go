@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,6 +90,13 @@ type Options struct {
 	// hour; negative disables it (Scan can still be called). Reads that
 	// find damage queue a heal regardless.
 	ScanInterval time.Duration
+	// StorageClasses maps a storage class name to the parity count its
+	// objects are written with (data = drives - parity). STANDARD is the
+	// set's own ParityBlocks and may not be redefined; REDUCED_REDUNDANCY
+	// defaults to parity 1. A class's parity must be between 1 and
+	// ParityBlocks: a class can be less redundant than STANDARD, never more.
+	// Objects keep the layout they were written with.
+	StorageClasses map[string]int
 	// DeploymentID, when set, identifies a deployment whose drives are not
 	// yet formatted. Nodes that format the same set concurrently must agree
 	// on it; if any drive already carries an ID, that one wins.
@@ -97,6 +105,12 @@ type Options struct {
 	// finished once the write quorum has: they are then dropped from the
 	// write and repaired by heal. 0 means 500ms; negative means do not wait.
 	StragglerGrace time.Duration
+	// OnTransitionFreed is called (after the change is committed, from the
+	// writer's goroutine) when a version whose data lives in a tier is
+	// removed or overwritten, so the remote copy can be deleted. It must
+	// not block; a copy missed here (a crash between commit and callback)
+	// is an orphan in the tier, not a correctness problem.
+	OnTransitionFreed func(bucket, object string, tr storage.TransitionInfo)
 	// WriteQueue is how many erasure blocks may be queued for one drive. A
 	// full queue holds the write back, since every drive is slower than
 	// memory; 0 means 8.
@@ -131,6 +145,11 @@ type XL struct {
 	k, m      int
 	blockSize int64
 	enc       reedsolomon.Encoder
+	// classes maps a storage class to its parity; encMu guards encs, the
+	// encoders of the layouts classes (and existing objects) use.
+	classes map[string]int
+	encMu   sync.Mutex
+	encs    map[[2]int]reedsolomon.Encoder
 
 	locker storage.Locker
 	log    *slog.Logger
@@ -139,6 +158,7 @@ type XL struct {
 	wantDeployment string
 
 	stragglerGrace time.Duration
+	onFreed        func(bucket, object string, tr storage.TransitionInfo)
 	writeQueue     int
 	stallTimeout   time.Duration
 
@@ -255,7 +275,11 @@ func NewWithDisks(ctx context.Context, disks []disk.Disk, opts Options) (*XL, er
 	if err != nil {
 		return nil, fmt.Errorf("xl: %w", err)
 	}
-	x := &XL{k: k, m: m, enc: enc, locker: opts.Locker, log: opts.Logger,
+	classes, err := resolveClasses(opts.StorageClasses, n, m)
+	if err != nil {
+		return nil, err
+	}
+	x := &XL{k: k, m: m, enc: enc, classes: classes, locker: opts.Locker, log: opts.Logger,
 		blockSize: opts.BlockSize, minPartSize: opts.MinPartSize, uploadExpiry: opts.UploadExpiry,
 		tmpMaxAge: opts.TmpMaxAge, healQ: make(chan healReq, 1024), wantDeployment: opts.DeploymentID}
 	if x.log == nil {
@@ -264,6 +288,7 @@ func NewWithDisks(ctx context.Context, disks []disk.Disk, opts Options) (*XL, er
 	if x.blockSize <= 0 {
 		x.blockSize = DefaultBlockSize
 	}
+	x.onFreed = opts.OnTransitionFreed
 	x.stragglerGrace, x.writeQueue = opts.StragglerGrace, opts.WriteQueue
 	if x.stragglerGrace == 0 {
 		x.stragglerGrace = 500 * time.Millisecond
@@ -397,11 +422,82 @@ func (x *XL) readQuorum() int { return x.k }
 // writeQuorum is the number of drives a write must reach. With K == M two
 // disjoint halves could each hold a "latest" version, so one more is
 // required; this guarantees the surviving old version is never a quorum.
-func (x *XL) writeQuorum() int {
-	if x.k == x.m {
-		return x.k + 1
+func (x *XL) writeQuorum() int { return quorumOf(x.k, x.m) }
+
+// quorumOf is the write quorum of a k+m layout.
+func quorumOf(k, m int) int {
+	if k == m {
+		return k + 1
 	}
-	return x.k
+	return k
+}
+
+// DefaultReducedParity is REDUCED_REDUNDANCY's parity when none is set.
+const DefaultReducedParity = 1
+
+// resolveClasses validates the configured storage classes for a set of n
+// drives whose STANDARD parity is std.
+func resolveClasses(in map[string]int, n, std int) (map[string]int, error) {
+	out := map[string]int{}
+	for name, p := range in {
+		switch {
+		case name == "" || len(name) > 32 || strings.ToUpper(name) != name || strings.ContainsAny(name, " \t/"):
+			return nil, fmt.Errorf("xl: storage class %q: names are 1-32 upper-case characters", name)
+		case name == "STANDARD":
+			if p != std {
+				return nil, fmt.Errorf("xl: STANDARD parity is the set's parity (%d); it cannot be set to %d", std, p)
+			}
+			continue
+		case p < 1 || p > n/2:
+			return nil, fmt.Errorf("xl: storage class %s: parity %d with %d drives; need 1 <= parity <= %d", name, p, n, n/2)
+		case p > std:
+			// An object's metadata is committed to, and read back from, a
+			// quorum sized for the set's own layout; an object that
+			// tolerated more lost drives than that could not be found once
+			// they were gone, so more parity than STANDARD buys nothing.
+			return nil, fmt.Errorf("xl: storage class %s: parity %d exceeds STANDARD's %d; classes may only be less redundant", name, p, std)
+		}
+		out[name] = p
+	}
+	if _, ok := out["REDUCED_REDUNDANCY"]; !ok {
+		out["REDUCED_REDUNDANCY"] = min(DefaultReducedParity, std)
+	}
+	return out, nil
+}
+
+// geomFor resolves a storage class to its erasure layout. class is the
+// canonical name to record: empty for STANDARD.
+func (x *XL) geomFor(class string) (k, m int, canonical string, err error) {
+	if class == "" || class == "STANDARD" {
+		return x.k, x.m, "", nil
+	}
+	p, ok := x.classes[class]
+	if !ok {
+		return 0, 0, "", fmt.Errorf("%w: %q", storage.ErrInvalidStorageClass, class)
+	}
+	return len(x.drives) - p, p, class, nil
+}
+
+// encoder returns the Reed-Solomon encoder of a k+m layout.
+func (x *XL) encoder(k, m int) (reedsolomon.Encoder, error) {
+	if k == x.k && m == x.m {
+		return x.enc, nil
+	}
+	x.encMu.Lock()
+	defer x.encMu.Unlock()
+	key := [2]int{k, m}
+	if e, ok := x.encs[key]; ok {
+		return e, nil
+	}
+	e, err := reedsolomon.New(k, m)
+	if err != nil {
+		return nil, err
+	}
+	if x.encs == nil {
+		x.encs = map[[2]int]reedsolomon.Encoder{}
+	}
+	x.encs[key] = e
+	return e, nil
 }
 
 // distribution returns, for a key, the shard index each drive stores:

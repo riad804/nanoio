@@ -27,9 +27,9 @@ var (
 	// ErrUnsupportedAlgorithm means a signing scheme other than
 	// AWS4-HMAC-SHA256 (SigV2, ECDSA) was used.
 	ErrUnsupportedAlgorithm = errors.New("auth: unsupported authorization mechanism")
-	// ErrInvalidToken means a session token was sent; temporary
-	// credentials are not supported.
-	ErrInvalidToken = errors.New("auth: security tokens are not supported")
+	// ErrInvalidToken means a temporary credential was used without its
+	// session token, or with a wrong one.
+	ErrInvalidToken = errors.New("auth: the session token is missing or does not match")
 	// ErrInvalidPayloadHash means x-amz-content-sha256 is not a known value.
 	ErrInvalidPayloadHash = errors.New("auth: invalid x-amz-content-sha256")
 	// ErrUnsignedHeaders means x-amz-* headers were sent but not signed.

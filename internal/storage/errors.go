@@ -39,6 +39,9 @@ var (
 	// ErrObjectLocked means object lock refuses the change: a legal hold,
 	// or retention that has not ended and that the caller may not bypass.
 	ErrObjectLocked = errors.New("object is protected by object lock")
+
+	// ErrAlreadyTransitioned means the version's data is already in a tier.
+	ErrAlreadyTransitioned = errors.New("object version is already transitioned")
 	// ErrObjectLockNotEnabled means the bucket was not created with object
 	// lock, so there is nothing to configure or apply.
 	ErrObjectLockNotEnabled = errors.New("bucket does not have object lock enabled")
@@ -47,6 +50,8 @@ var (
 	// ErrInvalidBucketState means the bucket's state does not allow the
 	// request, such as suspending versioning on a bucket with object lock.
 	ErrInvalidBucketState = errors.New("invalid bucket state")
+	// ErrInvalidStorageClass is a storage class the backend does not offer.
+	ErrInvalidStorageClass = errors.New("invalid storage class")
 	// ErrInvalidVersionID is a version ID that is neither "null" nor a UUID.
 	ErrInvalidVersionID = errors.New("invalid version id")
 )
@@ -90,7 +95,7 @@ func AllErrors() []error {
 		ErrNoSuchUpload, ErrInvalidPart, ErrInvalidPartOrder,
 		ErrEntityTooSmall, ErrLockTimeout, ErrBackendUnavailable,
 		ErrDiskFull, ErrCorrupted, ErrNotImplemented, ErrIllegalVersioning, ErrInvalidVersionID,
-		ErrObjectLocked, ErrObjectLockNotEnabled, ErrInvalidRetention, ErrInvalidBucketState,
+		ErrObjectLocked, ErrObjectLockNotEnabled, ErrInvalidRetention, ErrInvalidBucketState, ErrInvalidStorageClass,
 	}
 }
 

@@ -49,6 +49,9 @@ const (
 	EnvKMSKESCA          = "NANOIO_KMS_KES_CA"
 	EnvAllowInsecureSSEC = "NANOIO_ALLOW_INSECURE_SSEC"
 
+	// Event notifications.
+	EnvNotifyQueueDir = "NANOIO_NOTIFY_QUEUE_DIR"
+
 	// Distributed mode.
 	EnvNodeID           = "NANOIO_NODE_ID"
 	EnvClusterSecret    = "NANOIO_CLUSTER_SECRET"
@@ -132,6 +135,12 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// StorageClass configures one storage class: objects written with it keep
+// Parity parity shards (the set's data shards are its drives minus parity).
+type StorageClass struct {
+	Parity int `json:"parity"`
+}
+
 // KMS configures the key management service behind SSE-S3 and SSE-KMS.
 // Backend "" disables them (SSE-C still works).
 type KMS struct {
@@ -161,6 +170,69 @@ type KMS struct {
 	} `json:"kes"`
 }
 
+// Notify configures bucket event notifications.
+type Notify struct {
+	// QueueDir holds the replay log and every target's durable queue.
+	// Empty selects "<first local drive or root>/.nanoio.sys/events", so
+	// queued events live (and are lost) with the node's data.
+	QueueDir string `json:"queueDir"`
+	// ReplayBytes bounds the replay log kept for event streams: 0 means
+	// 64 MiB, a negative value disables it.
+	ReplayBytes int64 `json:"replayBytes"`
+	// Targets configures destinations: type -> id -> that target's JSON
+	// document (see the package of each target for its keys). A bucket
+	// refers to one by the ARN arn:minio:sqs:<region>:<id>:<type>.
+	Targets map[string]map[string]json.RawMessage `json:"targets"`
+}
+
+// Lifecycle configures the background lifecycle scanner.
+type Lifecycle struct {
+	// Disabled turns the scanner off (bucket lifecycle documents can still
+	// be stored).
+	Disabled bool `json:"disabled"`
+	// Interval is the minimum time between scans of one bucket (default 1h).
+	Interval Duration `json:"interval"`
+	// OpsPerSecond bounds objects examined plus actions per second, per
+	// node (default 500; negative disables the limit).
+	OpsPerSecond float64 `json:"opsPerSecond"`
+}
+
+// Tier configures the node-local side of tiering; the tiers themselves are
+// registered at run time through the admin API.
+type Tier struct {
+	// CacheDir holds the read-through cache of transitioned objects
+	// (default "<data dir>/.nanoio.sys/tier-cache"); CacheBytes bounds it
+	// (default 1 GiB) and CacheTTL is how long a read-through entry lives
+	// (default 24h).
+	CacheDir   string   `json:"cacheDir"`
+	CacheBytes int64    `json:"cacheBytes"`
+	CacheTTL   Duration `json:"cacheTTL"`
+}
+
+// Batch configures the batch-job runner.
+type Batch struct {
+	// Disabled turns the runner off on this node.
+	Disabled bool `json:"disabled"`
+	// Workers is how many batch tasks this node runs at once (default 2).
+	Workers int `json:"workers"`
+}
+
+// Replication configures bucket replication on this node.
+type Replication struct {
+	// Disabled turns replication off on this node: replicated writes and
+	// queued tasks are not processed.
+	Disabled bool `json:"disabled"`
+	// Workers is how many objects this node replicates at once (default 4).
+	Workers int `json:"workers"`
+	// ScanInterval is how often buckets are scanned for versions still
+	// PENDING (default 10m).
+	ScanInterval Duration `json:"scanInterval"`
+}
+
+// NotifyTargetTypes lists the target types the server implements, in the
+// order they were added.
+var NotifyTargetTypes = []string{"webhook", "kafka", "amqp", "mqtt", "nats", "redis", "mysql", "postgresql", "elasticsearch"}
+
 // Config is the server configuration.
 type Config struct {
 	// Root is the data directory served by the fs backend. Set exactly one
@@ -189,8 +261,22 @@ type Config struct {
 	RootPassword string `json:"rootPassword"`
 	// Cluster, when set, selects distributed mode.
 	Cluster *Cluster `json:"cluster"`
+	// StorageClasses defines extra storage classes for the xl and cluster
+	// backends, by name. STANDARD is the set's own parity (Parity);
+	// REDUCED_REDUNDANCY defaults to parity 1.
+	StorageClasses map[string]StorageClass `json:"storageClasses"`
 	// KMS configures server-side encryption with managed keys.
 	KMS KMS `json:"kms"`
+	// Notify configures bucket event notifications.
+	Notify Notify `json:"notify"`
+	// Lifecycle configures lifecycle (expiration, transition) scanning.
+	Lifecycle Lifecycle `json:"lifecycle"`
+	// Tier configures the transitioned-object cache.
+	Tier Tier `json:"tier"`
+	// Batch configures the batch-job runner.
+	Batch Batch `json:"batch"`
+	// Replication configures bucket replication.
+	Replication Replication `json:"replication"`
 	// AllowInsecureSSEC accepts SSE-C keys over connections that are not
 	// TLS. Off by default: the key travels in a header.
 	AllowInsecureSSEC bool `json:"allowInsecureSSEC"`
@@ -243,10 +329,16 @@ func Load(path string, getenv func(string) string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("config: %w", err)
 		}
-		if st, err := os.Stat(path); err == nil && st.Mode().Perm()&0o077 != 0 && bytes.Contains(data, []byte(`"rootPassword"`)) {
-			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-				"%s holds rootPassword and is accessible to other users (mode %04o); chmod 600 it or use %s",
-				path, st.Mode().Perm(), EnvRootPassword))
+		if st, err := os.Stat(path); err == nil && st.Mode().Perm()&0o077 != 0 {
+			for _, secret := range []string{"rootPassword", "authToken", "connectionString", "dsn", `"password"`, `"token"`} {
+				if !bytes.Contains(data, []byte(secret)) {
+					continue
+				}
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+					"%s holds secrets (%s) and is accessible to other users (mode %04o); chmod 600 it or use %s",
+					path, strings.Trim(secret, `"`), st.Mode().Perm(), EnvRootPassword))
+				break
+			}
 		}
 		dec := json.NewDecoder(bytes.NewReader(data))
 		dec.DisallowUnknownFields()
@@ -357,6 +449,9 @@ func Load(path string, getenv func(string) string) (Config, error) {
 		if v := getenv(e.env); v != "" {
 			*e.dst = v
 		}
+	}
+	if v := getenv(EnvNotifyQueueDir); v != "" {
+		cfg.Notify.QueueDir = v
 	}
 	if v := getenv(EnvAllowInsecureSSEC); v != "" {
 		b, err := strconv.ParseBool(v)
@@ -498,7 +593,113 @@ func (c *Config) Finalize() error {
 	if c.ShutdownTimeout <= 0 {
 		return errors.New("config: shutdownTimeout must be positive")
 	}
+	if err := c.finalizeStorageClasses(); err != nil {
+		return err
+	}
+	if err := c.finalizeNotify(); err != nil {
+		return err
+	}
+	if err := c.finalizeLifecycle(); err != nil {
+		return err
+	}
+	if err := c.finalizeTier(); err != nil {
+		return err
+	}
+	if err := c.finalizeBatch(); err != nil {
+		return err
+	}
+	if err := c.finalizeReplication(); err != nil {
+		return err
+	}
 	return c.finalizeKMS()
+}
+
+func (c *Config) finalizeReplication() error {
+	r := &c.Replication
+	if r.Workers < 0 || r.Workers > 256 || r.ScanInterval < 0 {
+		return errors.New("config: replication.workers must be 0-256 and scanInterval not negative")
+	}
+	return nil
+}
+
+func (c *Config) finalizeBatch() error {
+	if c.Batch.Workers < 0 || c.Batch.Workers > 64 {
+		return errors.New("config: batch.workers must be between 0 and 64")
+	}
+	return nil
+}
+
+func (c *Config) finalizeTier() error {
+	t := &c.Tier
+	if t.CacheBytes < 0 || t.CacheTTL < 0 {
+		return errors.New("config: tier.cacheBytes and tier.cacheTTL must not be negative")
+	}
+	if t.CacheDir != "" {
+		abs, err := filepath.Abs(t.CacheDir)
+		if err != nil {
+			return fmt.Errorf("config: tier.cacheDir: %w", err)
+		}
+		t.CacheDir = abs
+	}
+	return nil
+}
+
+func (c *Config) finalizeLifecycle() error {
+	l := &c.Lifecycle
+	if l.Interval < 0 {
+		return errors.New("config: lifecycle.interval must not be negative")
+	}
+	if l.Interval == 0 {
+		l.Interval = Duration(time.Hour)
+	}
+	if l.OpsPerSecond == 0 {
+		l.OpsPerSecond = 500
+	}
+	return nil
+}
+
+func (c *Config) finalizeNotify() error {
+	n := &c.Notify
+	if n.QueueDir != "" {
+		abs, err := filepath.Abs(n.QueueDir)
+		if err != nil {
+			return fmt.Errorf("config: notify.queueDir: %w", err)
+		}
+		n.QueueDir = abs
+	}
+	for typ, targets := range n.Targets {
+		known := false
+		for _, t := range NotifyTargetTypes {
+			known = known || t == typ
+		}
+		if !known {
+			return fmt.Errorf("config: notify.targets.%s: unknown target type (known: %s)", typ, strings.Join(NotifyTargetTypes, ", "))
+		}
+		for id, raw := range targets {
+			if id == "" || len(id) > 64 || strings.Trim(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != "" {
+				return fmt.Errorf("config: notify.targets.%s.%q: the id must be 1-64 letters, digits, '.', '_' or '-'", typ, id)
+			}
+			if len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
+				return fmt.Errorf("config: notify.targets.%s.%s must be a JSON object", typ, id)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Config) finalizeStorageClasses() error {
+	for name, sc := range c.StorageClasses {
+		if name == "" || len(name) > 32 || strings.ToUpper(name) != name || strings.ContainsAny(name, " \t/") {
+			return fmt.Errorf("config: storageClasses %q: names are 1-32 upper-case characters", name)
+		}
+		if sc.Parity < 1 {
+			return fmt.Errorf("config: storageClasses.%s.parity must be at least 1", name)
+		}
+	}
+	if len(c.StorageClasses) > 0 && c.Root != "" {
+		c.Warnings = append(c.Warnings, "storageClasses is ignored by the fs backend, which accepts only STANDARD")
+	}
+	return nil
 }
 
 func (c *Config) finalizeKMS() error {

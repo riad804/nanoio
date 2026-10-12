@@ -36,8 +36,18 @@ const (
 	// file, ignore the lock and drop it on its next rewrite, which would
 	// quietly void a retention; it refuses the file instead.
 	FormatLocked = 3
+	// FormatClassed is the schema of files in which some version records a
+	// storage class (and so possibly a non-default erasure layout). A build
+	// that predates storage classes would read such an object as damaged and
+	// might "repair" it; it refuses the file instead.
+	FormatClassed = 4
+	// FormatTiered is the schema of files in which some version has been
+	// transitioned to a remote tier and is only a stub (no local data). A
+	// build that predates tiering would treat the stub as an object with no
+	// data directory and refuse or "repair" it; it refuses the file.
+	FormatTiered = 5
 	// MaxFormat is the newest schema this build understands.
-	MaxFormat = FormatLocked
+	MaxFormat = FormatTiered
 
 	headerSize = 16
 	// maxPayload bounds decode allocations on hostile input.
@@ -105,6 +115,24 @@ type Version struct {
 	// Lock is the version's object lock state; nil when it has none. Only
 	// object versions carry one.
 	Lock *Lock `json:"lock,omitempty"`
+	// StorageClass is the class the object was written with, empty for
+	// STANDARD. It selects the object's erasure layout (see Erasure).
+	StorageClass string `json:"storageClass,omitempty"`
+	// Transition is set once the version's data has moved to a tier. The
+	// version is then a stub: no DataDir and no Erasure, but its size, ETag,
+	// metadata and lock are unchanged.
+	Transition *Transition `json:"transition,omitempty"`
+}
+
+// Transition says where a transitioned version's data lives.
+type Transition struct {
+	// Tier names the configured tier.
+	Tier string `json:"tier"`
+	// Object is the object's name in the tier, VersionID its remote
+	// version (empty if the tier does not version).
+	Object    string    `json:"object"`
+	VersionID string    `json:"versionId,omitempty"`
+	Time      time.Time `json:"time"`
 }
 
 // Part describes one stored part of an object.
@@ -150,6 +178,12 @@ func Encode(f *File) ([]byte, error) {
 	}
 	if c.usesLock() {
 		c.Format = FormatLocked
+	}
+	if c.usesStorageClass() {
+		c.Format = FormatClassed
+	}
+	if c.usesTier() {
+		c.Format = FormatTiered
 	}
 	if err := c.validate(); err != nil {
 		return nil, err
@@ -221,8 +255,11 @@ func (f *File) validate() error {
 		v := &f.Versions[i]
 		switch v.Type {
 		case TypeObject:
-			if v.DataDir == "" {
+			if v.DataDir == "" && v.Transition == nil {
 				return fmt.Errorf("%w: version %q: object without dataDir", ErrCorrupt, v.VersionID)
+			}
+			if v.Transition != nil && (v.DataDir != "" || v.Transition.Tier == "" || v.Transition.Object == "") {
+				return fmt.Errorf("%w: version %q: malformed transition stub", ErrCorrupt, v.VersionID)
 			}
 			if v.Size < 0 {
 				return fmt.Errorf("%w: version %q: negative size", ErrCorrupt, v.VersionID)
@@ -269,6 +306,26 @@ func (f *File) usesVersioning() bool {
 	return false
 }
 
+// usesStorageClass reports whether any version records a storage class.
+func (f *File) usesStorageClass() bool {
+	for i := range f.Versions {
+		if f.Versions[i].StorageClass != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// usesTier reports whether any version is a transitioned stub.
+func (f *File) usesTier() bool {
+	for i := range f.Versions {
+		if f.Versions[i].Transition != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // usesLock reports whether any version carries an object lock.
 func (f *File) usesLock() bool {
 	for i := range f.Versions {
@@ -279,17 +336,43 @@ func (f *File) usesLock() bool {
 	return false
 }
 
-// newer reports whether a sorts before b in newest-first order: by sequence
-// (zero, from before versioning, sorts last), then by modification time,
-// then by version ID so the order is total.
+// newer reports whether a sorts before b in newest-first order: by
+// modification time, then by sequence number (zero, from before versioning,
+// sorts last), then by version ID so the order is total.
+//
+// Time leads so that a version imported by replication under its original
+// ID and time takes its place in the history rather than on top of it. A
+// write made in this cluster is given a time strictly after the key's
+// newest version (see MonotonicTime), so for local writes this is still
+// commit order whatever the nodes' clocks say.
 func newer(a, b *Version) bool {
-	if a.Seq != b.Seq {
-		return a.Seq > b.Seq
-	}
 	if !a.ModTime.Equal(b.ModTime) {
 		return a.ModTime.After(b.ModTime)
 	}
+	if a.Seq != b.Seq {
+		return a.Seq > b.Seq
+	}
 	return a.VersionID > b.VersionID
+}
+
+// MonotonicTime returns a modification time for a new version of f's key:
+// now, unless the key already has a version at or after now (clock skew
+// between nodes, or an imported replica from a faster clock), in which case
+// one microsecond past the newest.
+func (f *File) MonotonicTime(now time.Time) time.Time {
+	if f == nil || len(f.Versions) == 0 {
+		return now
+	}
+	newest := f.Versions[0].ModTime
+	for i := range f.Versions {
+		if f.Versions[i].ModTime.After(newest) {
+			newest = f.Versions[i].ModTime
+		}
+	}
+	if !now.After(newest) {
+		return newest.Add(time.Microsecond)
+	}
+	return now
 }
 
 func sortVersions(vs []Version) {

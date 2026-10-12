@@ -7,12 +7,13 @@ NANOIO_ROOT_PASSWORD ?= nanoadmin-dev-secret
 export NANOIO_ROOT_USER NANOIO_ROOT_PASSWORD
 BIN  ?= bin/nanoio
 
-.PHONY: all build test run fmt vet fuzz clean help
+.PHONY: all build test oracle run fmt vet fuzz clean help
 
 all: test build
 
 help:
 	@echo "make test   vet + all tests with the race detector"
+	@echo "make oracle  admin API checked against MinIO's madmin-go (separate module)"
 	@echo "make run    start the server on ROOT (default ./data); Ctrl-C to stop"
 	@echo "make build  build $(BIN)"
 	@echo "make fuzz   10s fuzz run of the metadata decoder"
@@ -26,6 +27,10 @@ vet:
 
 test: vet
 	$(GO) test -race -count=1 ./...
+
+# madmin-go is AGPL-3.0: it is linked only into this test module, never the server.
+oracle:
+	cd test/madmin-oracle && GOFLAGS=-mod=mod $(GO) test -count=1 ./...
 
 run: build
 	./$(BIN) --root $(ROOT)

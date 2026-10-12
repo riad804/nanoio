@@ -110,7 +110,7 @@ domain), not this feature.
 - [ ] **A drive restored from a backup older than a retention change** holds the old, weaker lock under an older generation; quorum outvotes it and heal overwrites it. If more than half of a set is restored from such backups, the weaker state wins; backups are outside the guarantee.
 - [ ] **Rolling upgrade**: nodes must all run a build that knows `bucket.settings.get` / `bucket.lock.set` before a lock bucket is created. Version-list files containing a lock are `xl.meta` format 3, which older builds refuse to read (by design: they would drop the lock on rewrite).
 - [x] `CopyObject` does not inherit retention or legal hold from its source; it applies the request's lock headers or the destination bucket's default. An in-place copy refuses lock headers.
-- [ ] Object lock status is not in `ListObjectVersions` output, and there are no S3 event notifications for retention changes.
+- [ ] Object lock status is not in `ListObjectVersions` output, and there are no S3 event notifications for retention changes (Phase 11 emits Created/Removed/Accessed only).
 - [ ] `DeleteObjects` honours the bypass header per key (AccessDenied for a key the principal may not bypass); the `s3:BypassGovernanceRetention` check is made once per key, before any deletion.
 - [ ] With `--insecure-no-auth` anyone may send the bypass header and it is honoured; COMPLIANCE is unaffected.
 
@@ -157,10 +157,30 @@ domain), not this feature.
 - [ ] `x-amz-checksum-*` of encrypted payloads is still not verified; compression is not implemented (and must precede encryption when it is).
 - [ ] No rollback protection: an attacker with disk write access can restore an older, consistent version of an object.
 
+## Phase 10 - bucket configuration: done (see docs/bucket-config-design.md)
+- [x] 10a bucket policies (`?policy`): Principal/NotPrincipal, conditions incl. `aws:Referer`/`aws:UserAgent`, Deny > Allow > default deny unioned with identity policies, anonymous requests judged by the bucket policy only
+- [x] 10b ACLs (`?acl`, `x-amz-acl`, `x-amz-grant-*`) mapped onto the policy engine
+- [x] 10c CORS (`?cors`, preflight, response headers)
+- [x] 10d object and bucket tagging; tag condition keys
+- [x] 10e storage classes; per-object erasure layout in xl
+
+## Known limitations of bucket configuration
+- [ ] **Bucket configuration is eventually consistent across nodes** (5 s cache); a policy or ACL change may take that long to apply on another node. The root credential bypasses policies by design.
+- [ ] **A storage class can be less redundant than STANDARD, not more.** Supporting more would need per-object metadata read quorums (and re-proving the linearizability of version-list commits).
+- [ ] **Changing a class rewrites the object** (self-copy); there is no in-place re-encode, and no lifecycle transition.
+- [ ] ACL grantees are access keys and the two groups only (no e-mail, no LogDelivery); `bucket-owner-*` and `aws-exec-read` canned ACLs are refused. There is no Block Public Access and no `?policyStatus`.
+- [ ] Anonymous bulk delete (`POST ?delete`) is refused outright.
+- [ ] `s3:RequestObjectTagKeys` and the `ForAllValues`/`ForAnyValue` operators are not supported. Tag condition keys compare the tag name case-insensitively (policy condition keys are lower-cased).
+- [ ] No CORS `Allow-Credentials` control, and `Access-Control-Allow-Methods` lists the matching rule's methods rather than only the requested one.
+- [ ] The bucket name `nanoio-sys-config` is reserved.
+- [ ] Every request to a bucket reads its policy and (when nothing allowed it yet) its ACL and the object's: cached 5 s for bucket documents, but an object ACL for an anonymous or unprivileged read costs one metadata read.
+- [ ] `xl.meta` format 4 files (any object with a storage class) cannot be read by older builds; upgrade every node before the first non-STANDARD write.
+
 ## Known limitations of authentication / IAM
 - [ ] **No TLS.** Signatures protect integrity and authenticity, not confidentiality; put a TLS-terminating proxy in front for anything but loopback. `aws:SecureTransport` is therefore always `false`.
 - [ ] **IAM changes need a restart** (no SIGHUP reload, no admin API). Add atomic reload.
-- [ ] **No groups, bucket policies, ACLs, STS/temporary credentials, or anonymous (public) access.** Policies attach to users only. `X-Amz-Security-Token` is refused (`InvalidToken`).
+- [x] Bucket policies, ACLs and anonymous access arrive with Phase 10.
+- [ ] **No groups or STS/temporary credentials.** Identity policies attach to users only. `X-Amz-Security-Token` is refused (`InvalidToken`).
 - [ ] **Policy language subset**: actions must be `s3:*`; condition operators are String(Not)Equals / (Not)Like / EqualsIgnoreCase, Bool, (Not)IpAddress and Numeric*; no `IfExists`, `ForAllValues`, date operators or `aws:CurrentTime`. Only `${aws:username}` (the access key) is a policy variable. Unsupported constructs are rejected at load, never ignored.
 - [ ] Condition keys provided: `aws:SourceIp` (TCP peer; `X-Forwarded-For` is deliberately not trusted), `aws:SecureTransport`, `aws:username`, `s3:prefix`, `s3:delimiter`, `s3:max-keys`.
 - [ ] SigV2 (header and presigned) is refused with a clear message, which includes `aws` CLI v1's default presign. Use `aws configure set default.s3.signature_version s3v4`. SigV4A (ECDSA) is unsupported.
@@ -191,4 +211,41 @@ domain), not this feature.
 - [ ] distributed lock manager behind `storage.Locker`
 - [ ] `internal/iam`: users, groups, policies
 - [ ] `internal/bucket`: bucket config, lifecycle
-- [ ] `internal/event`: webhook, then kafka/amqp targets (dependency decision in design doc)
+- [x] `internal/event`: bus, replay log, durable queues, nine targets, admin stream (Phase 11; see docs/event-design.md)
+
+## Phase 11 (event notifications) open items
+- [x] Kafka (apache/kafka), MySQL 8.4, RabbitMQ, NATS and Mosquitto were run against real servers in Docker on 2026-10-12 (env-gated tests: `NANOIO_TEST_KAFKA`, `NANOIO_TEST_MYSQL_DSN`, `NANOIO_TEST_AMQP`, `NANOIO_TEST_NATS`, `NANOIO_TEST_MQTT`); Redis and PostgreSQL run against local binaries. **Elasticsearch has only been tested against an httptest fake.**
+- [ ] `s3:ObjectCreated:Post`, `s3:ObjectRestore:*`, `s3:LifecycleExpiration:*` are accepted in configurations but never produced (no POST upload, restore or lifecycle engine).
+- [ ] The tag-filter XML form (`<Filter><S3Tag><FilterRule>`) is NanoIO's own; it is not known to match any MinIO syntax.
+- [ ] `ListenBucketNotification` (`mc watch`) is not implemented.
+- [ ] Replicated queues (cluster mode) order across nodes only by clock; a lease holder that is partitioned without noticing can duplicate deliveries; not yet exercised on a multi-process cluster with a real node kill.
+- [ ] Crash window between publish and the first queue fsync (milliseconds) can lose an event; graceful stop cannot.
+
+## Phase 12 (lifecycle, tiering, batch) open items
+- [ ] Tier and batch-job secrets are stored unencrypted in the system bucket (masked in listings). Seal them with the KMS.
+- [ ] Transitioned objects cannot be drained out of a pool (the stub cannot be recreated on another set); the drain reports them as failed.
+- [ ] The restore cache is node-local; `x-amz-restore` is reported only after an explicit `POST ?restore`, not for implicit read-through caching.
+- [ ] Lifecycle transitions upload through the node that runs the scan; there is no spreading of large transitions across nodes (batch jobs do spread).
+- [ ] Batch `replicate` copies the latest version only (no history, ACLs or object-lock settings); `keyrotate` handles SSE-KMS and SSE-S3 only, never SSE-C.
+- [ ] Lifecycle `NoncurrentVersionTransition` works per the same rules as `Transition` but is covered by evaluator tests only, not end to end.
+- [ ] A lifecycle scan whose leader is partitioned from the lock quorum without noticing can overlap its successor (duplicate, idempotent actions).
+
+## Phase 13 (replication) open items
+- [ ] **Version order changed** from commit sequence to modification time (`meta.newer`), made safe for local writes by `MonotonicTime`; a node with a clock far ahead can still make an imported or skewed version sort above later writes. Consider a hybrid logical clock.
+- [ ] Site replication has no automatic divergence detection, no merge of concurrently changed IAM/config documents (whole-document last-writer-wins), and conflicts are kept only in memory (last 100).
+- [ ] Site replication does not carry tiers, notification config, KMS keys or batch jobs; service-account secrets cross the wire at join (use TLS).
+- [ ] Replication of permanent version deletes (`DeleteReplication`) is refused, not implemented; ACLs are not replicated.
+- [ ] Replication counters are per node and in memory.
+- [ ] Bucket-replication tasks are node-local queues recovered by the PENDING scan (every 10 min); a node lost with many queued tasks delays them by up to one scan interval.
+- [ ] Replicas of multipart objects are single-part (source ETag preserved in metadata only).
+
+## Phase 14 (admin API, identity federation): done (see docs/admin-api-design.md)
+
+- [x] `/minio/admin/v3` and `/minio/kms/v1` (hand-implemented), signed-only, per-action authorisation; `mc admin ...` run unmodified
+- [x] STS: AssumeRole, AssumeRoleWithWebIdentity, AssumeRoleWithLDAPIdentity, GetCallerIdentity; session tokens enforced
+- [x] OIDC (discovery, JWKS rotation, claim mapping) and LDAP (search-bind, group/DN mapping, TLS, TTL revalidation)
+- [ ] Not implemented (return a clear error): rebalance, service restart, heal dry-run/remove/recreate, KMS key management, scanner metrics stream, speedtest
+- [ ] Object/version counts in `admin info` and `datausageinfo` are not tracked (reported 0)
+- [ ] One OpenID and one LDAP provider per server; no OIDC userinfo / claim_prefix
+- [ ] STS credentials are cluster-local and not replicated by site replication
+- [ ] `export-iam` / `export-bucket-metadata` archives are NanoIO-format, not MinIO-interchangeable

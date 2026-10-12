@@ -87,6 +87,9 @@ func fileFingerprint(f *meta.File) string {
 		if e := v.Erasure; e != nil {
 			fmt.Fprintf(&b, ",%d+%d/%d", e.DataBlocks, e.ParityBlocks, e.BlockSize)
 		}
+		if t := v.Transition; t != nil {
+			fmt.Fprintf(&b, ",T:%s/%s/%s", t.Tier, t.Object, t.VersionID)
+		}
 	}
 	return b.String()
 }
@@ -97,6 +100,9 @@ func versionFingerprint(v *meta.Version) string {
 	e := ""
 	if v.Erasure != nil {
 		e = fmt.Sprintf("%d+%d/%d", v.Erasure.DataBlocks, v.Erasure.ParityBlocks, v.Erasure.BlockSize)
+	}
+	if t := v.Transition; t != nil {
+		e += fmt.Sprintf(",T:%s/%s/%s", t.Tier, t.Object, t.VersionID)
 	}
 	return fmt.Sprintf("%s,%d,%s,%d,%s,%d,%s,%s,%s", v.VersionID, v.Seq, v.Type, v.ModTime.UnixNano(), v.ETag, v.Size,
 		v.DataDir, v.ContentType, e)
@@ -239,10 +245,13 @@ func (x *XL) failure(st *objState, bucket, object string) error {
 
 // versionFor builds the per-drive version from a template: the erasure
 // block records this drive's shard index and part checksums.
-func (x *XL) versionFor(tmpl meta.Version, dist []int, drive int, sums []meta.Checksum, blockSize int64) meta.Version {
+func (x *XL) versionFor(tmpl meta.Version, dist []int, drive int, sums []meta.Checksum, blockSize int64, k, m int) meta.Version {
+	if k == 0 {
+		k, m = x.k, x.m
+	}
 	v := tmpl
 	v.Erasure = &meta.Erasure{
-		Algorithm: algorithm, DataBlocks: x.k, ParityBlocks: x.m, BlockSize: blockSize,
+		Algorithm: algorithm, DataBlocks: k, ParityBlocks: m, BlockSize: blockSize,
 		Index: dist[drive], Distribution: dist, Checksums: sums,
 	}
 	return v
@@ -256,6 +265,8 @@ type commitSpec struct {
 	op             disk.CommitOp
 	stageID        string
 	dataDir        string
+	// k and m are the erasure layout of an OpPut; zero means the set's.
+	k, m int
 	// tmpl is the version without Erasure: VersionID, Seq, ModTime set.
 	// For OpMarker it is the whole delete marker.
 	tmpl meta.Version
@@ -266,6 +277,8 @@ type commitSpec struct {
 	lock *meta.Lock
 	// metaUpd is the change of OpSetMeta.
 	metaUpd *meta.MetaUpdate
+	// transition is the stub OpTransition installs.
+	transition *meta.Transition
 	// guard is how object lock is judged on every drive; guard.Now is set
 	// once by the coordinator so all drives decide alike.
 	guard     meta.Guard
@@ -327,11 +340,11 @@ func (x *XL) commit(ctx context.Context, spec commitSpec) commitResult {
 			req := disk.CommitRequest{
 				Bucket: spec.bucket, Object: spec.object, Op: spec.op, StageID: spec.stageID, DataDir: spec.dataDir,
 				VersionID: spec.removeID, Seq: spec.tmpl.Seq, CheckGen: spec.checkGen, PrevGen: spec.prevGen,
-				Lock: spec.lock, Meta: spec.metaUpd, Guard: spec.guard,
+				Lock: spec.lock, Meta: spec.metaUpd, Transition: spec.transition, Guard: spec.guard,
 			}
 			switch spec.op {
 			case disk.OpPut:
-				req.Version = x.versionFor(spec.tmpl, spec.dist, d.idx, spec.sums[d.idx], spec.blockSize)
+				req.Version = x.versionFor(spec.tmpl, spec.dist, d.idx, spec.sums[d.idx], spec.blockSize, spec.k, spec.m)
 			case disk.OpMarker:
 				req.Version = spec.tmpl
 			case disk.OpReplace:
@@ -387,7 +400,7 @@ func (x *XL) finish(ctx context.Context, spec commitSpec, res commitResult) {
 // follow-up runs detached from ctx: a client that gave up must not leave a
 // half-committed object behind.
 func (x *XL) finishCommit(ctx context.Context, spec commitSpec, res commitResult) error {
-	need := x.writeQuorum()
+	need := max(x.writeQuorum(), spec.need)
 	if len(res.committed) < need {
 		dctx, cancel := detached(ctx)
 		defer cancel()
@@ -413,12 +426,15 @@ func toInfo(bucket, object string, v *meta.Version, latest bool, state storage.V
 		Bucket: bucket, Name: object, VersionID: storage.ReportedVersionID(state, v.VersionID), IsLatest: latest,
 		DeleteMarker: v.Type == meta.TypeDeleteMarker,
 		Size:         v.Size, ModTime: v.ModTime, ETag: v.ETag, ContentType: v.ContentType,
-		UserDefined: copyMap(v.UserMeta),
+		UserDefined: copyMap(v.UserMeta), StorageClass: v.StorageClass,
 	}
 	for _, p := range v.Parts {
 		info.Parts = append(info.Parts, storage.PartInfo{Number: p.N, ETag: p.ETag, Size: p.Size})
 	}
 	info.Retention, info.LegalHold = objlock.Info(v.Lock)
+	if t := v.Transition; t != nil {
+		info.Transition = &storage.TransitionInfo{Tier: t.Tier, Object: t.Object, VersionID: t.VersionID, Time: t.Time}
+	}
 	return info
 }
 

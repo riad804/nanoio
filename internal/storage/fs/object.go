@@ -81,6 +81,10 @@ func (f *FS) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 	if size > maxObjectSize {
 		return zero, storage.Wrap(storage.ErrEntityTooLarge, bucket, object)
 	}
+	if opts.StorageClass != "" && opts.StorageClass != "STANDARD" {
+		// A single directory has no redundancy to vary.
+		return zero, storage.Wrap(storage.ErrInvalidStorageClass, bucket, object)
+	}
 	if err := f.enter(); err != nil {
 		return zero, err
 	}
@@ -273,13 +277,24 @@ func (f *FS) commit(bucket, object, stageDir, stagedData string, ver meta.Versio
 		return zero, err
 	}
 	now := time.Now().UTC()
+	modTime := file.MonotonicTime(now)
+	if imp := opts.Import; imp != nil {
+		sid, ierr := importID(cfg.State, imp)
+		if ierr != nil {
+			return zero, storage.Wrap(ierr, bucket, object)
+		}
+		if old := file.Find(sid); old != nil {
+			return toInfo(bucket, object, old, file.Latest() == old, cfg.State), nil
+		}
+		id, modTime = sid, imp.ModTime.UTC()
+	}
 	ver.Lock, err = objlock.Resolve(lockCfg.cfg, opts, now)
 	if err != nil {
 		return zero, storage.Wrap(err, bucket, object)
 	}
 	ver.VersionID = id
 	ver.Seq = file.Generation() + 1
-	ver.ModTime = now
+	ver.ModTime = modTime
 	dataDir := ver.DataDir
 	superseded, err := file.ApplyPut(ver, objlock.Guard(now, false))
 	if err != nil {
@@ -341,7 +356,20 @@ func (f *FS) commit(bucket, object, stageDir, stagedData string, ver meta.Versio
 			f.log.Warn("fs: could not remove replaced data dir", "bucket", bucket, "object", object, "err", err)
 		}
 	}
-	return toInfo(bucket, object, file.Find(id), true, cfg.State), nil
+	nv := file.Find(id)
+	return toInfo(bucket, object, nv, file.Latest() == nv, cfg.State), nil
+}
+
+// importID validates an import against the bucket's state and returns the
+// stored version ID.
+func importID(state storage.VersioningState, imp *storage.VersionImport) (string, error) {
+	if state == storage.VersioningUnversioned {
+		return "", fmt.Errorf("%w: replicas need a versioned bucket", storage.ErrInvalidBucketState)
+	}
+	if imp.ModTime.IsZero() {
+		return "", errors.New("an imported version needs its modification time")
+	}
+	return storage.StoredVersionID(imp.VersionID)
 }
 
 // lookup resolves bucket/object[/versionID] to a version and its directory.
@@ -738,7 +766,18 @@ func (f *FS) DeleteObject(ctx context.Context, bucket, object string, opts stora
 		if err != nil {
 			return storage.DeleteResult{}, err
 		}
-		dirs, err := file.ApplyMarker(id, file.Generation()+1, time.Now().UTC(), guard)
+		modTime := file.MonotonicTime(time.Now().UTC())
+		if imp := opts.ImportMarker; imp != nil {
+			sid, ierr := importID(cfg.State, imp)
+			if ierr != nil {
+				return storage.DeleteResult{}, storage.Wrap(ierr, bucket, object)
+			}
+			if file.Find(sid) != nil {
+				return storage.DeleteResult{VersionID: storage.ReportedVersionID(cfg.State, sid), DeleteMarker: true}, nil
+			}
+			id, modTime = sid, imp.ModTime.UTC()
+		}
+		dirs, err := file.ApplyMarker(id, file.Generation()+1, modTime, guard)
 		if err != nil {
 			return storage.DeleteResult{}, objlock.Err(err, bucket, object)
 		}

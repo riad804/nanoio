@@ -44,8 +44,11 @@ type uploadDoc struct {
 	UserDefined  map[string]string `json:"userDefined,omitempty"`
 	DataBlocks   int               `json:"dataBlocks"`
 	ParityBlocks int               `json:"parityBlocks"`
-	BlockSize    int64             `json:"blockSize"`
-	Distribution []int             `json:"distribution"`
+	// StorageClass is the class the upload was started with ("" STANDARD);
+	// it fixes the layout of every part and of the finished object.
+	StorageClass string `json:"storageClass,omitempty"`
+	BlockSize    int64  `json:"blockSize"`
+	Distribution []int  `json:"distribution"`
 	// Lock is the object lock requested when the upload was started.
 	Lock objlock.Requested `json:"lock,omitzero"`
 }
@@ -100,7 +103,8 @@ func (x *XL) readUpload(ctx context.Context, bucket, object, id string) (*upload
 			if doc.Bucket != bucket || (object != "" && doc.Object != object) {
 				return nil, storage.Wrap(storage.ErrNoSuchUpload, bucket, object)
 			}
-			if doc.DataBlocks != x.k || doc.ParityBlocks != x.m || len(doc.Distribution) != len(x.drives) {
+			if doc.ParityBlocks < 1 || doc.DataBlocks < doc.ParityBlocks ||
+				doc.DataBlocks+doc.ParityBlocks != len(x.drives) || len(doc.Distribution) != len(x.drives) {
 				return nil, storage.Wrap(fmt.Errorf("%w: upload was created with a different erasure layout", storage.ErrCorrupted), bucket, object)
 			}
 			return doc, nil
@@ -145,9 +149,13 @@ func (x *XL) NewMultipartUpload(ctx context.Context, bucket, object string, opts
 	if err != nil {
 		return "", storage.Wrap(err, bucket, object)
 	}
+	gk, gm, class, err := x.geomFor(opts.StorageClass)
+	if err != nil {
+		return "", storage.Wrap(err, bucket, object)
+	}
 	docBytes, err := json.Marshal(uploadDoc{
 		Bucket: bucket, Object: object, Initiated: time.Now().UTC(), ContentType: ct,
-		UserDefined: copyMap(opts.UserDefined), DataBlocks: x.k, ParityBlocks: x.m,
+		UserDefined: copyMap(opts.UserDefined), DataBlocks: gk, ParityBlocks: gm, StorageClass: class,
 		BlockSize: x.blockSize, Distribution: x.distribution(bucket, object), Lock: req,
 	})
 	if err != nil {
@@ -249,19 +257,24 @@ func (x *XL) PutObjectPart(ctx context.Context, bucket, object, uploadID string,
 	stageID := "part-" + token
 	defer x.removeStages(ctx, stageID)
 	dataName := fmt.Sprintf("%d.%s.data", partNumber, token)
-	ws, participants := x.openWriters(ctx, stageID, dataName, doc.Distribution)
-	if live := countWriters(ws); live < x.writeQuorum() {
+	enc, err := x.encoder(doc.DataBlocks, doc.ParityBlocks)
+	if err != nil {
+		return zero, err
+	}
+	wq := max(quorumOf(doc.DataBlocks, doc.ParityBlocks), x.writeQuorum())
+	ws, participants := x.openWriters(ctx, stageID, dataName, doc.Distribution, wq)
+	if live := countWriters(ws); live < wq {
 		abortWriters(ws)
-		return zero, quorumError(bucket, object, live, x.writeQuorum(), nil)
+		return zero, quorumError(bucket, object, live, wq, nil)
 	}
 	md5h := md5.New()
 	var shah = newSHA(opts.ContentSHA256)
-	n, err := x.encodeStream(ctx, r, size, doc.BlockSize, ws, x.writeQuorum(), md5h, shah)
+	n, err := x.encodeStream(ctx, enc, r, size, doc.BlockSize, ws, wq, md5h, shah)
 	if err != nil {
 		abortWriters(ws)
 		switch {
 		case errors.Is(err, errQuorumLost):
-			return zero, quorumError(bucket, object, countWriters(ws), x.writeQuorum(), nil)
+			return zero, quorumError(bucket, object, countWriters(ws), wq, nil)
 		case errors.Is(err, io.ErrUnexpectedEOF):
 			return zero, storage.Wrap(storage.ErrIncompleteBody, bucket, object)
 		}
@@ -280,9 +293,9 @@ func (x *XL) PutObjectPart(ctx context.Context, bucket, object, uploadID string,
 		abortWriters(ws)
 		return zero, storage.Wrap(storage.ErrSHA256Mismatch, bucket, object)
 	}
-	roots, okDrives := x.settleWriters(ctx, ws, doc.Distribution, participants, x.writeQuorum())
-	if live := countTrue(okDrives); live < x.writeQuorum() {
-		return zero, quorumError(bucket, object, live, x.writeQuorum(), nil)
+	roots, okDrives := x.settleWriters(ctx, ws, doc.Distribution, participants, wq)
+	if live := countTrue(okDrives); live < wq {
+		return zero, quorumError(bucket, object, live, wq, nil)
 	}
 
 	unlockBucket, err := x.locker.RLock(ctx, bucket, "")
@@ -306,7 +319,7 @@ func (x *XL) PutObjectPart(ctx context.Context, bucket, object, uploadID string,
 			return errDriveOffline
 		}
 		rec, err := json.Marshal(disk.PartRecord{Number: partNumber, File: dataName, Size: n, ETag: etag, ModTime: now,
-			Root: roots[d.idx], ShardSize: disk.ShardFileSize(n, doc.BlockSize, x.k)})
+			Root: roots[d.idx], ShardSize: disk.ShardFileSize(n, doc.BlockSize, doc.DataBlocks)})
 		if err != nil {
 			return err
 		}
@@ -317,13 +330,13 @@ func (x *XL) PutObjectPart(ctx context.Context, bucket, object, uploadID string,
 	})
 	dctx, dcancel := detached(ctx)
 	defer dcancel()
-	if countNil(errs) < x.writeQuorum() {
+	if countNil(errs) < wq {
 		for i, c := range commits {
 			if c != nil && errs[i] == nil {
 				c.Rollback(dctx)
 			}
 		}
-		return zero, quorumError(bucket, object, countNil(errs), x.writeQuorum(), errs)
+		return zero, quorumError(bucket, object, countNil(errs), wq, errs)
 	}
 	// Quorum reached: the replaced part's data is dropped only now.
 	for i, c := range commits {
@@ -585,8 +598,9 @@ func (x *XL) CompleteMultipartUpload(ctx context.Context, bucket, object, upload
 		}
 		participants[i] = ok
 	}
-	if live := countTrue(participants); live < x.writeQuorum() {
-		return zero, quorumError(bucket, object, live, x.writeQuorum(), nil)
+	cwq := max(quorumOf(doc.DataBlocks, doc.ParityBlocks), x.writeQuorum())
+	if live := countTrue(participants); live < cwq {
+		return zero, quorumError(bucket, object, live, cwq, nil)
 	}
 	ct := doc.ContentType
 	if ct == "" {
@@ -595,9 +609,10 @@ func (x *XL) CompleteMultipartUpload(ctx context.Context, bucket, object, upload
 	info, err := x.publishVersion(ctx, bucket, object, publishSpec{
 		stageID: stageID, dataDir: dataDir, dist: doc.Distribution, blockSize: doc.BlockSize,
 		sums: sums, participants: participants,
+		k: doc.DataBlocks, m: doc.ParityBlocks, quorum: cwq,
 		tmpl: meta.Version{
 			Type: meta.TypeObject, Size: total, ETag: etag, DataDir: dataDir,
-			ContentType: ct, UserMeta: copyMap(doc.UserDefined), Parts: versionParts,
+			ContentType: ct, UserMeta: copyMap(doc.UserDefined), Parts: versionParts, StorageClass: doc.StorageClass,
 		},
 	}, objlock.Carry(opts, doc.Lock, time.Now()))
 	if err != nil {

@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/reedsolomon"
+
 	"nanoio/internal/storage"
 	"nanoio/internal/storage/xl/disk"
 )
@@ -200,7 +202,7 @@ var errQuorumLost = errors.New("write quorum lost while streaming")
 // Writers that fail are aborted and set to nil; if fewer than minLive
 // remain, encoding stops. md5h and shah (optional) see the plaintext. It
 // returns the plaintext byte count.
-func (x *XL) encodeStream(ctx context.Context, r io.Reader, size, blockSize int64, ws []*shardWriter,
+func (x *XL) encodeStream(ctx context.Context, enc reedsolomon.Encoder, r io.Reader, size, blockSize int64, ws []*shardWriter,
 	minLive int, md5h, shah hash.Hash) (int64, error) {
 	src := io.Reader(ctxReader{ctx, r})
 	if size >= 0 {
@@ -216,11 +218,11 @@ func (x *XL) encodeStream(ctx context.Context, r io.Reader, size, blockSize int6
 				shah.Write(buf[:n])
 			}
 			total += int64(n)
-			shards, err := x.enc.Split(buf[:n])
+			shards, err := enc.Split(buf[:n])
 			if err != nil {
 				return total, err
 			}
-			if err := x.enc.Encode(shards); err != nil {
+			if err := enc.Encode(shards); err != nil {
 				return total, err
 			}
 			if live := x.queueShards(ctx, ws, shards, minLive); live < minLive {

@@ -789,6 +789,26 @@ func (d *Local) commitObject(req CommitRequest) (Commit, error) {
 		case err != nil:
 			return nil, stale(err)
 		}
+	case OpTransition:
+		if file == nil {
+			return nil, fmt.Errorf("%w: %s/%s has no xl.meta here", ErrNotFound, req.Bucket, req.Object)
+		}
+		if req.Transition == nil {
+			return nil, errors.New("disk: OpTransition without Transition")
+		}
+		next = file
+		if req.Seq == 0 {
+			req.Seq = next.Generation() + 1
+		}
+		superseded, err = next.ApplyTransition(req.VersionID, req.Seq, *req.Transition)
+		switch {
+		case errors.Is(err, meta.ErrNoSuchVersion):
+			return nil, fmt.Errorf("%w: %v", ErrNotFound, err)
+		case errors.Is(err, meta.ErrAlreadyTransitioned):
+			return nil, fmt.Errorf("%w: %v", ErrConflict, err)
+		case err != nil:
+			return nil, stale(err)
+		}
 	case OpReplace:
 		if req.File == nil {
 			return nil, errors.New("disk: OpReplace without a file")

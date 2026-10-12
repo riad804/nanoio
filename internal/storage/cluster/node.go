@@ -19,6 +19,7 @@ import (
 	"nanoio/internal/cluster/dsync"
 	"nanoio/internal/cluster/rpc"
 	"nanoio/internal/cluster/rpcauth"
+	"nanoio/internal/storage"
 	"nanoio/internal/storage/xl"
 	"nanoio/internal/storage/xl/disk"
 	"nanoio/internal/storage/xl/disk/remote"
@@ -48,8 +49,11 @@ type NodeConfig struct {
 	Secrets []string
 	Pools   []PoolSpec
 
-	Parity    int
-	BlockSize int64
+	Parity int
+	// StorageClasses maps storage class names to parity counts; see
+	// xl.Options.StorageClasses.
+	StorageClasses map[string]int
+	BlockSize      int64
 
 	// TLS enables HTTPS between nodes. A cluster of more than one node
 	// without TLS is refused unless InsecurePlaintext is set (development
@@ -69,7 +73,9 @@ type NodeConfig struct {
 	ScanInterval     time.Duration
 	// StragglerGrace is passed to every set (see xl.Options).
 	StragglerGrace time.Duration
-	StartupTimeout time.Duration
+	// OnTransitionFreed is passed to every set (see xl.Options).
+	OnTransitionFreed func(bucket, object string, tr storage.TransitionInfo)
+	StartupTimeout    time.Duration
 	// BucketSync is passed to the Store; see Options.BucketSync.
 	BucketSync time.Duration
 }
@@ -272,10 +278,10 @@ func (n *Node) openSet(ctx context.Context, specs []string) (*xl.XL, error) {
 	}
 	sum := sha256.Sum256([]byte(strings.Join(specs, "|")))
 	return xl.NewWithDisks(ctx, disks, xl.Options{
-		Locker: n.locker, Logger: n.log, ParityBlocks: n.cfg.Parity, BlockSize: n.cfg.BlockSize,
+		Locker: n.locker, Logger: n.log, ParityBlocks: n.cfg.Parity, StorageClasses: n.cfg.StorageClasses, BlockSize: n.cfg.BlockSize,
 		UploadExpiry: n.cfg.UploadExpiry, ScanInterval: n.cfg.ScanInterval,
-		StragglerGrace: n.cfg.StragglerGrace,
-		DeploymentID:   hex.EncodeToString(sum[:16]),
+		StragglerGrace: n.cfg.StragglerGrace, OnTransitionFreed: n.cfg.OnTransitionFreed,
+		DeploymentID: hex.EncodeToString(sum[:16]),
 	})
 }
 

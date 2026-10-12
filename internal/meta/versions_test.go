@@ -154,12 +154,14 @@ func TestApplyMarkerAndRemove(t *testing.T) {
 	})
 }
 
-func TestOrderingBySeqNotClock(t *testing.T) {
-	// Seq 2 carries an EARLIER ModTime (a node with a slow clock wrote it):
-	// it is still the newer version.
+// Versions order by modification time, then sequence, then version ID, so a
+// replica imported under its original time lands in the history, not on top.
+// Local writes stay in commit order because they are given MonotonicTime.
+func TestOrderingByTimeThenSeq(t *testing.T) {
 	f := &File{Format: FormatVersion, Gen: 2, Versions: []Version{
-		{Type: TypeObject, VersionID: "a", Seq: 1, ModTime: t0.Add(time.Hour), DataDir: "da"},
-		{Type: TypeObject, VersionID: "b", Seq: 2, ModTime: t0, DataDir: "db"},
+		{Type: TypeObject, VersionID: "a", Seq: 2, ModTime: t0, DataDir: "da"},
+		{Type: TypeObject, VersionID: "b", Seq: 1, ModTime: t0.Add(time.Hour), DataDir: "db"},
+		{Type: TypeObject, VersionID: "c", Seq: 3, ModTime: t0.Add(time.Hour), DataDir: "dc"},
 	}}
 	b, err := Encode(f)
 	if err != nil {
@@ -169,22 +171,37 @@ func TestOrderingBySeqNotClock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := ids(g); !reflect.DeepEqual(got, []string{"b", "a"}) {
-		t.Errorf("order = %v, want [b a] (by sequence)", got)
+	if got := ids(g); !reflect.DeepEqual(got, []string{"c", "b", "a"}) {
+		t.Errorf("order = %v, want [c b a]", got)
 	}
-	if g.Latest().VersionID != "b" {
-		t.Error("latest is chosen by clock")
+	// An import with an old time and a high sequence goes below.
+	g.Add(Version{Type: TypeObject, VersionID: "late", Seq: 9, ModTime: t0.Add(-time.Hour), DataDir: "dl"})
+	if got := ids(g); !reflect.DeepEqual(got, []string{"c", "b", "a", "late"}) {
+		t.Errorf("after import = %v", got)
 	}
-	// Pre-versioning entries (no Seq) sort below sequenced ones, by time.
+	// Equal times: the higher version ID wins, deterministically on every drive.
 	h := &File{Format: FormatVersion, Versions: []Version{
-		{Type: TypeObject, VersionID: "old1", ModTime: t0, DataDir: "x"},
-		{Type: TypeObject, VersionID: "old2", ModTime: t0.Add(time.Hour), DataDir: "y"},
-		{Type: TypeObject, VersionID: "new", Seq: 1, ModTime: t0.Add(-time.Hour), DataDir: "z"},
+		{Type: TypeObject, VersionID: "m", ModTime: t0, DataDir: "x"},
+		{Type: TypeObject, VersionID: "z", ModTime: t0, DataDir: "y"},
 	}}
-	b, _ = Encode(h)
-	g, _ = Decode(b)
-	if got := ids(g); !reflect.DeepEqual(got, []string{"new", "old2", "old1"}) {
-		t.Errorf("mixed order = %v", got)
+	h.Add(Version{Type: TypeObject, VersionID: "q", ModTime: t0, DataDir: "w"})
+	if got := ids(h); !reflect.DeepEqual(got, []string{"z", "q", "m"}) {
+		t.Errorf("tie order = %v", got)
+	}
+}
+
+func TestMonotonicTime(t *testing.T) {
+	f := &File{Versions: []Version{{Type: TypeObject, VersionID: "a", ModTime: t0.Add(time.Hour), DataDir: "d"}}}
+	if got := f.MonotonicTime(t0); !got.After(t0.Add(time.Hour)) {
+		t.Errorf("a write behind the newest version got %v", got)
+	}
+	later := t0.Add(2 * time.Hour)
+	if got := f.MonotonicTime(later); !got.Equal(later) {
+		t.Errorf("a write after the newest was moved to %v", got)
+	}
+	var empty *File
+	if got := empty.MonotonicTime(t0); !got.Equal(t0) {
+		t.Errorf("nil file = %v", got)
 	}
 }
 

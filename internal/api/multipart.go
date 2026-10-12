@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"nanoio/internal/event"
 	"nanoio/internal/kms"
 	"nanoio/internal/sse"
 	"nanoio/internal/storage"
@@ -56,7 +57,7 @@ func (s *Server) multipartOp(q *request) {
 }
 
 func (s *Server) createMultipartUpload(q *request) {
-	if !s.authorize(q, "s3:PutObject", q.bucket, q.key, nil) {
+	if !s.authorize(q, "s3:PutObject", q.bucket, q.key, writeContext(q.r.Header)) {
 		return
 	}
 	if q.r.Header.Get("x-amz-copy-source") != "" {
@@ -77,6 +78,10 @@ func (s *Server) createMultipartUpload(q *request) {
 		return
 	}
 	opts.Retention, opts.LegalHold = lock.retention, lock.hold
+	opts.StorageClass = strings.TrimSpace(q.r.Header.Get("x-amz-storage-class"))
+	if !s.applyACLHeaders(q, &opts) || !s.applyTagHeader(q, &opts) {
+		return
+	}
 	spec, err := s.writeSpec(q, q.bucket)
 	if err != nil {
 		s.fail(q, err)
@@ -99,6 +104,7 @@ func (s *Server) createMultipartUpload(q *request) {
 		m.Put(ud)
 		opts.UserDefined, meta = ud, m
 	}
+	opts.UserDefined = s.replPrepare(q.ctx(), q.bucket, q.key, opts.UserDefined)
 	id, err := s.st.NewMultipartUpload(q.r.Context(), q.bucket, q.key, opts)
 	if err != nil {
 		s.fail(q, err)
@@ -277,7 +283,7 @@ func (s *Server) uploadPartCopy(q *request, id string, n int) {
 		return
 	}
 	defer dst.close()
-	rc, info, err := s.st.GetObject(ctx, src.bucket, src.key, storage.GetOptions{VersionID: src.versionID})
+	rc, info, err := s.openObject(ctx, src.bucket, src.key, storage.GetOptions{VersionID: src.versionID})
 	if err != nil {
 		s.fail(q, err)
 		return
@@ -392,6 +398,8 @@ func (s *Server) completeMultipartUpload(q *request) {
 		Location: scheme + "://" + q.r.Host + "/" + q.bucket + "/" + q.key,
 		Bucket:   q.bucket, Key: q.key, ETag: `"` + info.ETag + `"`,
 	})
+	s.notify(q, event.ObjectCreatedCompleteMultipartUpload, objectFromInfo(info, q.key, ""))
+	s.replAfterPut(q.ctx(), q.bucket, q.key, info.VersionID, info.UserDefined)
 }
 
 func (s *Server) abortMultipartUpload(q *request) {

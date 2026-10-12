@@ -77,6 +77,18 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 		return zero, err
 	}
 
+	gk, gm, class, err := x.geomFor(opts.StorageClass)
+	if err != nil {
+		return zero, storage.Wrap(err, bucket, object)
+	}
+	enc, err := x.encoder(gk, gm)
+	if err != nil {
+		return zero, err
+	}
+	// A write must reach the shards its own layout needs to be readable,
+	// and the metadata quorum of the set, whichever is more.
+	wq := max(quorumOf(gk, gm), x.writeQuorum())
+
 	stageID, err := newToken()
 	if err != nil {
 		return zero, err
@@ -85,10 +97,10 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 	defer x.removeStages(ctx, stageID)
 
 	dist := x.distribution(bucket, object)
-	ws, participants := x.openWriters(ctx, stageID, dataDir+"/part.1", dist)
-	if live := countWriters(ws); live < x.writeQuorum() {
+	ws, participants := x.openWriters(ctx, stageID, dataDir+"/part.1", dist, wq)
+	if live := countWriters(ws); live < wq {
 		abortWriters(ws)
-		return zero, quorumError(bucket, object, live, x.writeQuorum(), nil)
+		return zero, quorumError(bucket, object, live, wq, nil)
 	}
 
 	md5h := md5.New()
@@ -96,12 +108,12 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 	if opts.ContentSHA256 != "" {
 		shah = sha256.New()
 	}
-	n, err := x.encodeStream(ctx, r, size, x.blockSize, ws, x.writeQuorum(), md5h, shah)
+	n, err := x.encodeStream(ctx, enc, r, size, x.blockSize, ws, wq, md5h, shah)
 	if err != nil {
 		abortWriters(ws)
 		switch {
 		case errors.Is(err, errQuorumLost):
-			return zero, quorumError(bucket, object, countWriters(ws), x.writeQuorum(), nil)
+			return zero, quorumError(bucket, object, countWriters(ws), wq, nil)
 		case errors.Is(err, io.ErrUnexpectedEOF):
 			return zero, storage.Wrap(storage.ErrIncompleteBody, bucket, object)
 		}
@@ -121,9 +133,9 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 		return zero, storage.Wrap(storage.ErrSHA256Mismatch, bucket, object)
 	}
 
-	roots, parts := x.settleWriters(ctx, ws, dist, participants, x.writeQuorum())
-	if live := countTrue(parts); live < x.writeQuorum() {
-		return zero, quorumError(bucket, object, live, x.writeQuorum(), nil)
+	roots, parts := x.settleWriters(ctx, ws, dist, participants, wq)
+	if live := countTrue(parts); live < wq {
+		return zero, quorumError(bucket, object, live, wq, nil)
 	}
 
 	unlockBucket, err := x.locker.RLock(ctx, bucket, "")
@@ -148,10 +160,11 @@ func (x *XL) PutObject(ctx context.Context, bucket, object string, r io.Reader, 
 	}
 	return x.publishVersion(ctx, bucket, object, publishSpec{
 		stageID: stageID, dataDir: dataDir, dist: dist, blockSize: x.blockSize, sums: sums, participants: parts,
+		k: gk, m: gm, quorum: wq,
 		tmpl: meta.Version{
 			Type: meta.TypeObject, Size: n, ETag: etag, DataDir: dataDir, ContentType: ct,
-			UserMeta: opts.FinalUserDefined(),
-			Parts:    []meta.Part{{N: 1, Size: n, ETag: etag}},
+			UserMeta: opts.FinalUserDefined(), StorageClass: class,
+			Parts: []meta.Part{{N: 1, Size: n, ETag: etag}},
 		},
 	}, opts)
 }
@@ -164,7 +177,11 @@ type publishSpec struct {
 	blockSize        int64
 	sums             [][]meta.Checksum
 	participants     []bool
-	tmpl             meta.Version
+	// k and m are the object's erasure layout and quorum the number of
+	// drives its commit must reach.
+	k, m   int
+	quorum int
+	tmpl   meta.Version
 }
 
 // metaVersioning converts a bucket's state to the form the meta mutation
@@ -209,31 +226,51 @@ func (x *XL) publishVersion(ctx context.Context, bucket, object string, ps publi
 	// The bucket's lock configuration is part of the settings read under
 	// the shared bucket lock, so what is applied is what the bucket says now.
 	now := time.Now().UTC()
+	modTime := now
+	if st.found(x.k) {
+		modTime = st.file.MonotonicTime(now)
+	}
+	if imp := opts.Import; imp != nil {
+		sid, ierr := importID(cfg.cfg.State, imp)
+		if ierr != nil {
+			return zero, storage.Wrap(ierr, bucket, object)
+		}
+		if st.found(x.k) {
+			if old := st.file.Find(sid); old != nil {
+				return toInfo(bucket, object, old, st.file.Latest() == old, cfg.cfg.State), nil
+			}
+		}
+		id, modTime = sid, imp.ModTime.UTC()
+	}
 	lock, err := objlock.Resolve(cfg.lock.cfg, opts, now)
 	if err != nil {
 		return zero, storage.Wrap(err, bucket, object)
 	}
 	tmpl := ps.tmpl
-	tmpl.VersionID, tmpl.Seq, tmpl.ModTime, tmpl.Lock = id, prev+1, now, lock
+	tmpl.VersionID, tmpl.Seq, tmpl.ModTime, tmpl.Lock = id, prev+1, modTime, lock
 	spec := commitSpec{bucket: bucket, object: object, op: disk.OpPut, stageID: ps.stageID, dataDir: ps.dataDir,
 		tmpl: tmpl, dist: ps.dist, blockSize: ps.blockSize, sums: ps.sums, participants: ps.participants,
-		checkGen: true, prevGen: prev, need: x.writeQuorum(), guard: objlock.Guard(now, false)}
+		checkGen: true, prevGen: prev, need: max(ps.quorum, x.writeQuorum()), k: ps.k, m: ps.m, guard: objlock.Guard(now, false)}
 	res := x.commit(ctx, spec)
 	if err := x.finishCommit(ctx, spec, res); err != nil {
 		return zero, mapErr(err, bucket, object)
 	}
 	x.noteVersioning(bucket, cfg.cfg)
-	return toInfo(bucket, object, &tmpl, true, cfg.cfg.State), nil
+	if st.found(x.k) && id == meta.NullVersion {
+		x.noteFreed(bucket, object, st.file.Find(meta.NullVersion)) // overwrote the null version
+	}
+	latest := !st.found(x.k) || !st.file.Latest().ModTime.After(modTime)
+	return toInfo(bucket, object, &tmpl, latest, cfg.cfg.State), nil
 }
 
 // openWriters stages the shard file rel under stageID on the drives,
 // returning writers indexed by shard and which drives participate. It
 // returns once a write quorum of drives has a staged file (plus the
 // straggler grace); a drive that answers later has its file discarded.
-func (x *XL) openWriters(ctx context.Context, stageID, rel string, dist []int) (ws []*shardWriter, participants []bool) {
+func (x *XL) openWriters(ctx context.Context, stageID, rel string, dist []int, quorum int) (ws []*shardWriter, participants []bool) {
 	ws = make([]*shardWriter, len(x.drives))
 	participants = make([]bool, len(x.drives))
-	got, errs := scatter(ctx, x, x.writeQuorum(), x.stragglerGrace, true, false,
+	got, errs := scatter(ctx, x, quorum, x.stragglerGrace, true, false,
 		func(ctx context.Context, d *drive) (*shardWriter, error) {
 			return newShardWriter(ctx, d, stageID, rel, x.writeQueue)
 		},
@@ -431,6 +468,10 @@ func (x *XL) GetObject(ctx context.Context, bucket, object string, opts storage.
 		return nil, zero, err
 	}
 	info := toInfo(bucket, object, v, latest, state)
+	if v.Transition != nil {
+		// The data is in a tier; the caller streams it from there.
+		return nil, zero, &storage.TransitionedError{Info: info}
+	}
 	if rg := opts.Range; rg != nil {
 		if rg.Start < 0 || rg.Length <= 0 || rg.Start+rg.Length > v.Size {
 			return nil, zero, storage.Wrap(storage.ErrInvalidRange, bucket, object)
@@ -512,9 +553,18 @@ func (x *XL) DeleteObject(ctx context.Context, bucket, object string, opts stora
 				return storage.DeleteResult{}, objlock.Err(err, bucket, object)
 			}
 		}
+		var gone *meta.File
+		if obj := x.stateOf(ctx, bucket, object); obj.found(x.k) {
+			gone = obj.file
+		}
 		errs := x.each(ctx, func(d *drive) error { return d.DeleteObject(ctx, bucket, object) })
 		if countNil(errs) < x.writeQuorum() {
 			return storage.DeleteResult{}, quorumError(bucket, object, countNil(errs), x.writeQuorum(), errs)
+		}
+		if gone != nil {
+			for i := range gone.Versions {
+				x.noteFreed(bucket, object, &gone.Versions[i])
+			}
 		}
 		return storage.DeleteResult{}, nil
 	}
@@ -559,6 +609,20 @@ func (x *XL) DeleteObject(ctx context.Context, bucket, object string, opts stora
 		if err != nil {
 			return storage.DeleteResult{}, err
 		}
+		markerTime := now
+		if known {
+			markerTime = obj.file.MonotonicTime(now)
+		}
+		if imp := opts.ImportMarker; imp != nil {
+			sid, ierr := importID(state, imp)
+			if ierr != nil {
+				return storage.DeleteResult{}, storage.Wrap(ierr, bucket, object)
+			}
+			if known && obj.file.Find(sid) != nil {
+				return storage.DeleteResult{VersionID: storage.ReportedVersionID(state, sid), DeleteMarker: true}, nil
+			}
+			id, markerTime = sid, imp.ModTime.UTC()
+		}
 		if known {
 			// Replacing the null version (suspended buckets) removes it.
 			if old := obj.file.Find(id); old != nil {
@@ -568,12 +632,20 @@ func (x *XL) DeleteObject(ctx context.Context, bucket, object string, opts stora
 			}
 		}
 		spec.op = disk.OpMarker
-		spec.tmpl = meta.Version{Type: meta.TypeDeleteMarker, VersionID: id, Seq: prev + 1, ModTime: now}
+		spec.tmpl = meta.Version{Type: meta.TypeDeleteMarker, VersionID: id, Seq: prev + 1, ModTime: markerTime}
 		res.VersionID, res.DeleteMarker = storage.ReportedVersionID(state, id), true
 	}
 	cres := x.commit(ctx, spec)
 	if err := x.finishCommit(ctx, spec, cres); err != nil {
 		return storage.DeleteResult{}, mapErr(err, bucket, object)
+	}
+	if known {
+		switch spec.op {
+		case disk.OpRemove:
+			x.noteFreed(bucket, object, obj.file.Find(spec.removeID))
+		case disk.OpMarker:
+			x.noteFreed(bucket, object, obj.file.Find(spec.tmpl.VersionID))
+		}
 	}
 	return res, nil
 }

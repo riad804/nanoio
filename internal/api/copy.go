@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"nanoio/internal/event"
 	"nanoio/internal/kms"
 	"nanoio/internal/sse"
 	"nanoio/internal/storage"
@@ -59,8 +60,13 @@ func (s *Server) copyObject(q *request) {
 		s.fail(q, invalidArgument("Unknown metadata directive."))
 		return
 	}
-	if h.Get("x-amz-tagging-directive") != "" || h.Get("x-amz-storage-class") != "" && h.Get("x-amz-storage-class") != "STANDARD" {
-		s.fail(q, notImplemented("tagging directive or storage class on CopyObject"))
+	tagDirective := strings.ToUpper(strings.TrimSpace(h.Get("x-amz-tagging-directive")))
+	switch tagDirective {
+	case "":
+		tagDirective = "COPY"
+	case "COPY", "REPLACE":
+	default:
+		s.fail(q, invalidArgument("Unknown tagging directive."))
 		return
 	}
 	newMeta, err := parseObjectMeta(h)
@@ -87,7 +93,7 @@ func (s *Server) copyObject(q *request) {
 	explicit := sseHeadersPresent(h)
 
 	ctx := q.r.Context()
-	rc, info, err := s.st.GetObject(ctx, src.bucket, src.key, storage.GetOptions{VersionID: src.versionID})
+	rc, info, err := s.openObject(ctx, src.bucket, src.key, storage.GetOptions{VersionID: src.versionID})
 	if err != nil {
 		s.fail(q, err)
 		return
@@ -120,15 +126,37 @@ func (s *Server) copyObject(q *request) {
 			ct = "binary/octet-stream"
 		}
 	} else {
-		ud = sse.Strip(info.UserDefined)
+		ud = stripInternal(info.UserDefined)
 	}
+
+	// An ACL is never copied; the destination is private unless the request
+	// names one.
+	po := storage.PutOptions{UserDefined: ud}
+	if !s.applyACLHeaders(q, &po) {
+		return
+	}
+	if tagDirective == "REPLACE" {
+		if !s.applyTagHeader(q, &po) {
+			return
+		}
+	} else if t := info.UserDefined[tagsKey]; t != "" {
+		cp := make(map[string]string, len(po.UserDefined)+1)
+		for k, v := range po.UserDefined {
+			cp[k] = v
+		}
+		cp[tagsKey] = t
+		po.UserDefined = cp
+	}
+	ud = po.UserDefined
 
 	dstPath := q.bucket + "/" + q.key
 	srcVersion := info.VersionID
 
+	wantClass := strings.TrimSpace(h.Get("x-amz-storage-class"))
+	classChange := inPlace && wantClass != "" && canonicalClass(wantClass) != info.StorageClass
 	if inPlace {
 		changesEncryption := (srcEnc != nil && explicit) || (srcEnc == nil && spec != nil)
-		if !changesEncryption && directive != "REPLACE" {
+		if !changesEncryption && !classChange && directive != "REPLACE" {
 			s.fail(q, invalidRequest("This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes."))
 			return
 		}
@@ -136,7 +164,11 @@ func (s *Server) copyObject(q *request) {
 			s.fail(q, invalidRequest("Object lock headers cannot be applied to an in-place copy."))
 			return
 		}
-		if srcEnc != nil || spec == nil {
+		if classChange && srcEnc != nil && !explicit {
+			s.fail(q, invalidRequest("Changing the storage class of an encrypted object requires its encryption headers to be given again."))
+			return
+		}
+		if !classChange && (srcEnc != nil || spec == nil) {
 			// No data I/O: update the metadata, re-sealing the key if the
 			// encryption changes.
 			s.copyInPlace(q, info, srcEnc, spec, explicit, ud, ct, directive == "REPLACE", srcVersion, plainETag)
@@ -157,7 +189,12 @@ func (s *Server) copyObject(q *request) {
 		}
 		body, size = dec, srcEnc.size
 	}
-	opts := storage.PutOptions{ContentType: ct, UserDefined: ud, Retention: lock.retention, LegalHold: lock.hold}
+	ud = s.replPrepare(ctx, q.bucket, q.key, ud)
+	opts := storage.PutOptions{ContentType: ct, UserDefined: ud, Retention: lock.retention, LegalHold: lock.hold,
+		StorageClass: wantClass}
+	if self && wantClass == "" {
+		opts.StorageClass = info.StorageClass // rewriting an object does not silently change its class
+	}
 	if self {
 		opts.IfMatch = info.ETag // the object we read is the object we replace
 	}
@@ -192,6 +229,9 @@ func (s *Server) copyObject(q *request) {
 		setSSEHeaders(rh, meta, ssecKeyMD5(spec))
 	}
 	s.writeXML(q, http.StatusOK, &copyObjectResult{LastModified: isoTime(put.ModTime), ETag: `"` + etag + `"`})
+	s.notify(q, event.ObjectCreatedCopy, notifyObj{key: q.key, versionID: put.VersionID, etag: etag,
+		contentType: ct, size: srcSize(info, srcEnc), modTime: put.ModTime, ud: ud})
+	s.replAfterPut(ctx, q.bucket, q.key, put.VersionID, ud)
 }
 
 // copyInPlace applies a self-copy that needs no data I/O.
@@ -224,6 +264,7 @@ func (s *Server) copyInPlace(q *request, info storage.ObjectInfo, srcEnc *encObj
 			meta, clientMD5 = srcEnc.meta, srcEnc.clientMD5
 		}
 	}
+	out = s.replPrepare(q.ctx(), q.bucket, q.key, out)
 	upd, err := s.st.UpdateObjectMetadata(q.r.Context(), q.bucket, q.key, storage.UpdateMetaOptions{
 		VersionID: srcVersion, UserDefined: out, ContentType: ct, Touch: true, IfETag: info.ETag,
 	})
@@ -242,4 +283,35 @@ func (s *Server) copyInPlace(q *request, info storage.ObjectInfo, srcEnc *encObj
 		setSSEHeaders(h, meta, clientMD5)
 	}
 	s.writeXML(q, http.StatusOK, &copyObjectResult{LastModified: isoTime(upd.ModTime), ETag: `"` + plainETag + `"`})
+	s.notify(q, event.ObjectCreatedCopy, notifyObj{key: q.key, versionID: upd.VersionID, etag: plainETag,
+		contentType: ct, size: srcSize(info, srcEnc), modTime: upd.ModTime, ud: out})
+	s.replAfterPut(q.ctx(), q.bucket, q.key, upd.VersionID, out)
+}
+
+// srcSize is the plaintext size of a copy source.
+func srcSize(info storage.ObjectInfo, enc *encObject) int64 {
+	if enc != nil {
+		return enc.size
+	}
+	return info.Size
+}
+
+// stripInternal returns a copy of ud without any internal key (encryption
+// description, ACL): what a copy carries over from its source.
+func stripInternal(ud map[string]string) map[string]string {
+	out := make(map[string]string, len(ud))
+	for k, v := range ud {
+		if !strings.HasPrefix(k, internalPrefix) {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// canonicalClass is how a storage class is recorded: "" for STANDARD.
+func canonicalClass(c string) string {
+	if c == "STANDARD" {
+		return ""
+	}
+	return c
 }

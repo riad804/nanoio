@@ -194,7 +194,7 @@ func TestCannedPoliciesParse(t *testing.T) {
 			t.Errorf("canned policy %q missing", name)
 		}
 	}
-	if got := strings.Join(CannedPolicyNames(), ","); got != "readonly,readwrite,writeonly" {
+	if got := strings.Join(CannedPolicyNames(), ","); got != "consoleAdmin,diagnostics,readonly,readwrite,writeonly" {
 		t.Errorf("canned = %s", got)
 	}
 }

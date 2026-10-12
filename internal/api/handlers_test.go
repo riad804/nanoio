@@ -93,6 +93,7 @@ type testEnv struct {
 	fs     *fs.FS
 	host   string // host:port of srv
 	root   auth.Signer
+	iam    *iam.Store
 }
 
 // newEnv serves a real fs backend over HTTP with authentication on.
@@ -114,7 +115,7 @@ func serve(t *testing.T, st storage.StorageAPI, be *fs.FS, mutate ...func(*Optio
 	}
 	opts := Options{
 		Storage: st, Auth: &auth.Verifier{Provider: store, Region: "us-east-1"}, Authz: store,
-		Domains: []string{"localhost"}, Region: "us-east-1", Logger: quiet,
+		Domains: []string{"localhost"}, Region: "us-east-1", Logger: quiet, IAM: store,
 	}
 	for _, m := range mutate {
 		m(&opts)
@@ -126,7 +127,7 @@ func serve(t *testing.T, st storage.StorageAPI, be *fs.FS, mutate ...func(*Optio
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	u, _ := url.Parse(srv.URL)
-	return &testEnv{t: t, srv: srv, st: st, fs: be, host: u.Host, root: signerFor(rootAK)}
+	return &testEnv{t: t, srv: srv, st: st, fs: be, host: u.Host, root: signerFor(rootAK), iam: store}
 }
 
 type hdr map[string]string
@@ -537,7 +538,7 @@ func TestPutValidation(t *testing.T) {
 		{"unsigned payload", "/val/unsigned", "abc", hdr{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"}, 200, "", ""},
 		{"copy of a missing source", "/val/copy", "", hdr{"x-amz-copy-source": "/val/no-such-source"}, 404, "NoSuchKey", "copy"},
 		{"copy with a bad source", "/val/copybad", "", hdr{"x-amz-copy-source": "nobucketslash"}, 400, "InvalidArgument", "copybad"},
-		{"tagging is refused", "/val/tagged", "x", hdr{"x-amz-tagging": "a=b"}, 501, "NotImplemented", "tagged"},
+		{"reserved tag key", "/val/tagged", "x", hdr{"x-amz-tagging": "aws:a=b"}, 400, "InvalidTag", "tagged"},
 		{"metadata too large", "/val/bigmeta", "x", hdr{"x-amz-meta-big": strings.Repeat("a", 2100)}, 400, "MetadataTooLarge", "bigmeta"},
 		{"if-none-match on existing", "/val/existing", "v2", hdr{"If-None-Match": "*"}, 412, "PreconditionFailed", ""},
 		{"if-none-match on new", "/val/created-once", "v", hdr{"If-None-Match": "*"}, 200, "", ""},
@@ -1345,19 +1346,6 @@ func TestUnsupportedFeaturesAreRefused(t *testing.T) {
 	tests := []struct {
 		method, path string
 	}{
-		{"PUT", "/ghostbucket?acl"},
-		{"PUT", "/uns?acl"},
-		{"GET", "/uns?policy"},
-		{"PUT", "/uns?policy"},
-		{"DELETE", "/uns?policy"},
-		{"PUT", "/uns?lifecycle"},
-		{"PUT", "/uns?tagging"},
-		{"GET", "/uns/obj?acl"},
-		{"PUT", "/uns/obj?acl"},
-		{"GET", "/uns/obj?tagging"},
-		{"PUT", "/uns/obj?tagging"},
-		{"DELETE", "/uns/obj?tagging"},
-		{"GET", "/uns/obj?restore"},
 		{"GET", "/uns/obj?partNumber=2"}, // reading one part of a finished object
 		{"PUT", "/uns/obj?partNumber=1"}, // a part number with no upload id
 		{"POST", "/uns/obj?select&select-type=2"},

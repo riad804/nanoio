@@ -61,7 +61,7 @@ func TestParsePolicyRejects(t *testing.T) {
 		{"principal in identity policy", stmt(`{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"*"}`), "Principal"},
 		{"notprincipal", stmt(`{"Effect":"Allow","NotPrincipal":"*","Action":"s3:*","Resource":"*"}`), "Principal"},
 		{"non-s3 action", stmt(`{"Effect":"Allow","Action":"ec2:*","Resource":"*"}`), "only s3"},
-		{"admin action", stmt(`{"Effect":"Allow","Action":"admin:*","Resource":"*"}`), "only s3"},
+		{"unknown action family", stmt(`{"Effect":"Allow","Action":"iam:CreateUser","Resource":"*"}`), "supported"},
 		{"non-s3 resource", stmt(`{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:ec2:::x"}`), "arn:aws:s3"},
 		{"action not a string", stmt(`{"Effect":"Allow","Action":5,"Resource":"*"}`), "string"},
 		{"unsupported operator", stmt(`{"Effect":"Allow","Action":"s3:*","Resource":"*","Condition":{"ForAllValues:StringLike":{"s3:prefix":"a"}}}`), "not supported"},

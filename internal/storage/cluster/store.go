@@ -892,6 +892,22 @@ func (s *Store) UpdateObjectMetadata(ctx context.Context, bucket, object string,
 	return s.sets[set].UpdateObjectMetadata(ctx, bucket, object, opts)
 }
 
+var _ storage.Transitioner = (*Store)(nil)
+
+// TransitionObject installs a transitioned-object stub on the set that
+// holds the version.
+func (s *Store) TransitionObject(ctx context.Context, ref storage.ObjectRef, tr storage.TransitionInfo, ifETag string) (storage.ObjectInfo, error) {
+	set, err := s.setOf(ctx, ref)
+	if err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	t, ok := any(s.sets[set]).(storage.Transitioner)
+	if !ok {
+		return storage.ObjectInfo{}, storage.ErrNotImplemented
+	}
+	return t.TransitionObject(ctx, ref, tr, ifETag)
+}
+
 // ListObjectVersions merges one page of versions from every set, under the
 // same per-set deadline and failure policy as ListObjects. Entries order by
 // key, then newest first (a key's versions live on one set; the order of

@@ -22,6 +22,16 @@ type Verifier struct {
 	Provider CredentialProvider
 	// Region the credential scope must name. Empty accepts any region.
 	Region string
+	// AllowSessionToken accepts X-Amz-Security-Token; the caller must then
+	// check that it matches the credential (temporary credentials).
+	AllowSessionToken bool
+	// Service is the credential-scope service name the verifier requires;
+	// empty means "s3". (The STS endpoint is signed for "sts".)
+	Service string
+	// RegionlessPrefixes lists request path prefixes whose clients sign
+	// with an empty credential-scope region (the MinIO admin SDK does).
+	// Only an empty region is added to what is accepted there.
+	RegionlessPrefixes []string
 	// MaxSkew bounds |now - request time|; zero means 15 minutes.
 	MaxSkew time.Duration
 	// Now is the clock; nil means time.Now.
@@ -65,6 +75,9 @@ func (v *Verifier) skew() time.Duration {
 }
 
 func (v *Verifier) svc() string {
+	if v.Service != "" {
+		return v.Service
+	}
 	if v.service != "" {
 		return v.service
 	}
@@ -157,7 +170,7 @@ func parseCredential(s string) (credentialScope, bool) {
 
 // checkScope validates the date, region and service of a credential scope
 // against the request time and the server's configuration.
-func (v *Verifier) checkScope(sc credentialScope, t time.Time, malformed error) error {
+func (v *Verifier) checkScope(r *http.Request, sc credentialScope, t time.Time, malformed error) error {
 	if sc.date != t.UTC().Format(scopeDateLayout) {
 		return fmt.Errorf("%w: the date in the credential scope %q does not match the request date %q",
 			malformed, sc.date, t.UTC().Format(scopeDateLayout))
@@ -166,10 +179,22 @@ func (v *Verifier) checkScope(sc credentialScope, t time.Time, malformed error) 
 		return fmt.Errorf("%w: the credential scope service is %q, expecting %q",
 			malformed, sc.service, v.svc())
 	}
+	if sc.region == "" && v.regionless(r) {
+		return nil
+	}
 	if v.Region != "" && sc.region != v.Region {
 		return fmt.Errorf("%w: the region %q is wrong; expecting %q", malformed, sc.region, v.Region)
 	}
 	return nil
+}
+
+func (v *Verifier) regionless(r *http.Request) bool {
+	for _, p := range v.RegionlessPrefixes {
+		if r.URL != nil && strings.HasPrefix(r.URL.Path, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // unsignedAmzHeaders returns the x-amz-* headers present in the request
@@ -259,7 +284,7 @@ func (v *Verifier) authenticateHeader(r *http.Request, authz, rawQuery string) (
 		return nil, fmt.Errorf("%w: request time %s, server time %s",
 			ErrRequestTimeTooSkewed, t.UTC().Format(time.RFC3339), v.now().UTC().Format(time.RFC3339))
 	}
-	if err := v.checkScope(sc, t, ErrAuthHeaderMalformed); err != nil {
+	if err := v.checkScope(r, sc, t, ErrAuthHeaderMalformed); err != nil {
 		return nil, err
 	}
 	if !hasHost(signed) {
@@ -280,7 +305,7 @@ func (v *Verifier) authenticateHeader(r *http.Request, authz, rawQuery string) (
 		}
 	}
 	if !v.generic {
-		if r.Header.Get("X-Amz-Security-Token") != "" {
+		if !v.AllowSessionToken && r.Header.Get("X-Amz-Security-Token") != "" {
 			return nil, ErrInvalidToken
 		}
 	}
@@ -325,7 +350,7 @@ func (v *Verifier) authenticatePresigned(r *http.Request, q url.Values, rawQuery
 			return nil, fmt.Errorf("%w: %s is required", ErrQueryParamsMalformed, p)
 		}
 	}
-	if q.Has("X-Amz-Security-Token") {
+	if !v.AllowSessionToken && q.Has("X-Amz-Security-Token") {
 		return nil, ErrInvalidToken
 	}
 	sc, ok := parseCredential(get("X-Amz-Credential"))
@@ -350,7 +375,7 @@ func (v *Verifier) authenticatePresigned(r *http.Request, q url.Values, rawQuery
 	if now.After(t.Add(time.Duration(secs) * time.Second)) {
 		return nil, ErrRequestExpired
 	}
-	if err := v.checkScope(sc, t, ErrQueryParamsMalformed); err != nil {
+	if err := v.checkScope(r, sc, t, ErrQueryParamsMalformed); err != nil {
 		return nil, err
 	}
 	signed := sortedLower(strings.Split(get("X-Amz-SignedHeaders"), ";"))

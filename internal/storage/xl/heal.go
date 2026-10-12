@@ -116,8 +116,8 @@ func (x *XL) versionHealthy(ctx context.Context, d *drive, st *objState, v *meta
 	if mine == nil || versionFingerprint(mine) != versionFingerprint(v) {
 		return false
 	}
-	if v.Type != meta.TypeObject {
-		return true
+	if v.Type != meta.TypeObject || v.Transition != nil {
+		return true // a delete marker or a stub has no shards to check
 	}
 	e := v.Erasure
 	if e == nil || mine.Erasure == nil {
@@ -129,13 +129,13 @@ func (x *XL) versionHealthy(ctx context.Context, d *drive, st *objState, v *meta
 	}
 	for _, p := range parts {
 		size, err := d.StatShard(ctx, bucket, object, v.DataDir, p.N)
-		if err != nil || size != disk.ShardFileSize(p.Size, e.BlockSize, x.k) {
+		if err != nil || size != disk.ShardFileSize(p.Size, e.BlockSize, e.DataBlocks) {
 			return false
 		}
 		if !deep {
 			continue
 		}
-		root, err := d.VerifyShard(ctx, bucket, object, v.DataDir, p.N, p.Size, e.BlockSize, x.k)
+		root, err := d.VerifyShard(ctx, bucket, object, v.DataDir, p.N, p.Size, e.BlockSize, e.DataBlocks)
 		if err != nil {
 			return false
 		}
@@ -238,7 +238,7 @@ func (x *XL) HealObject(ctx context.Context, bucket, object string, deep bool) (
 	rebuilt := make([][]string, len(x.drives)) // staged data dirs per drive
 	for _, pl := range plans {
 		v := pl.v
-		if v.Type != meta.TypeObject || len(pl.need) == 0 {
+		if v.Type != meta.TypeObject || v.Transition != nil || len(pl.need) == 0 {
 			continue
 		}
 		e := v.Erasure
@@ -246,10 +246,10 @@ func (x *XL) HealObject(ctx context.Context, bucket, object string, deep bool) (
 			unlockR()
 			return res, storage.Wrap(fmt.Errorf("%w: version %q has no valid distribution", storage.ErrCorrupted, v.VersionID), bucket, object)
 		}
-		if len(pl.good) < x.k {
+		if len(pl.good) < e.DataBlocks {
 			unlockR()
 			return res, storage.Wrap(fmt.Errorf("%w: version %q has %d intact copies, %d needed to rebuild",
-				storage.ErrCorrupted, v.VersionID, len(pl.good), x.k), bucket, object)
+				storage.ErrCorrupted, v.VersionID, len(pl.good), e.DataBlocks), bucket, object)
 		}
 		parts := v.Parts
 		if len(parts) == 0 {
@@ -350,7 +350,12 @@ func (x *XL) HealObject(ctx context.Context, bucket, object string, deep bool) (
 func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objState, v *meta.Version, good, need []int,
 	ok []bool, stageID string, p meta.Part, blockSize int64) (map[int]string, error) {
 	e := v.Erasure
-	n := x.k + x.m
+	hk, hm := e.DataBlocks, e.ParityBlocks
+	n := hk + hm
+	enc, err := x.encoder(hk, hm)
+	if err != nil {
+		return nil, err
+	}
 	// Open one source per good drive, keyed by the shard it holds.
 	type src struct {
 		f     disk.Shard
@@ -377,7 +382,7 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 		}
 		srcs = append(srcs, src{f: f, shard: rec.Erasure.Index})
 	}
-	if len(srcs) < x.k {
+	if len(srcs) < hk {
 		return nil, storage.Wrap(fmt.Errorf("%w: cannot open enough shards of part %d", storage.ErrCorrupted, p.N), bucket, object)
 	}
 	// Writers indexed by drive; the shard each takes is dist[drive].
@@ -408,22 +413,22 @@ func (x *XL) rebuildPart(ctx context.Context, bucket, object string, st *objStat
 		shards := make([][]byte, n)
 		have := 0
 		for _, s := range srcs {
-			if have >= x.k {
+			if have >= hk {
 				break
 			}
-			buf, err := readVerifiedShard(s.f, b, blockLen, blockSize, x.k)
+			buf, err := readVerifiedShard(s.f, b, blockLen, blockSize, hk)
 			if err != nil {
 				continue // a shard that failed verification mid-heal is skipped
 			}
 			shards[s.shard] = buf
 			have++
 		}
-		if have < x.k {
+		if have < hk {
 			abort()
 			return nil, storage.Wrap(fmt.Errorf("%w: block %d of part %d has only %d intact shards",
 				storage.ErrCorrupted, b, p.N, have), bucket, object)
 		}
-		if err := x.enc.Reconstruct(shards); err != nil {
+		if err := enc.Reconstruct(shards); err != nil {
 			abort()
 			return nil, storage.Wrap(fmt.Errorf("%w: reconstruct: %v", storage.ErrCorrupted, err), bucket, object)
 		}

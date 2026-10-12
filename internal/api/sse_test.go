@@ -73,7 +73,8 @@ func sseEnv(t *testing.T, backend string, mutate ...func(*Options)) *testEnv {
 		for i := range dirs {
 			dirs[i] = t.TempDir()
 		}
-		x, err := xl.New(dirs, xl.Options{Locker: nslock.New(5 * time.Second), Logger: quiet, ParityBlocks: 2, ScanInterval: -1})
+		x, err := xl.New(dirs, xl.Options{Locker: nslock.New(5 * time.Second), Logger: quiet, ParityBlocks: 2, ScanInterval: -1,
+			StorageClasses: map[string]int{"LIMITED": 1}})
 		if err != nil {
 			t.Fatal(err)
 		}

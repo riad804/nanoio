@@ -15,11 +15,16 @@ func TestImportRules(t *testing.T) {
 	}
 	// forbid lists module-relative prefixes a package must not reach, even
 	// transitively. "" forbids every module package (stdlib only).
+	// eventForbid is everything the notification packages must not reach:
+	// they may use the standard library, internal/config (for Duration) and
+	// each other.
+	eventForbid := []string{"internal/api", "internal/auth", "internal/iam", "internal/bucket", "internal/storage",
+		"internal/cluster", "internal/kms", "internal/sse", "internal/meta"}
 	tests := []struct {
 		pkg    string
 		forbid []string
 	}{
-		{"internal/api", []string{"internal/storage/fs", "internal/storage/xl"}},
+		{"internal/api", []string{"internal/storage/fs", "internal/storage/xl", "internal/event/target"}},
 		// auth and iam are leaf packages: standard library only, so
 		// credential and policy logic can never reach into storage or HTTP.
 		{"internal/auth", []string{""}},
@@ -51,8 +56,38 @@ func TestImportRules(t *testing.T) {
 		// Encryption: kms is standard library only; sse builds on kms alone,
 		// so key handling can never reach into storage, HTTP or auth.
 		{"internal/kms", []string{""}},
+		// Identity federation and the admin envelope are leaves: they know
+		// nothing of storage, HTTP routing or policy evaluation.
+		{"internal/identity/oidc", []string{""}},
+		{"internal/identity/ldap", []string{""}},
+		{"internal/madmincrypt", []string{""}},
 		{"internal/sse", []string{"internal/api", "internal/auth", "internal/iam", "internal/bucket", "internal/storage", "internal/cluster"}},
 		{"internal/storage", []string{""}},
+		// Notifications: the core and every target are independent of the
+		// server, so a client library can never reach the API or storage,
+		// and the API can never reach a client library (it sees only the
+		// event package; cmd/nanoio links the targets).
+		{"internal/event", eventForbid},
+		{"internal/event/target/targetutil", eventForbid},
+		{"internal/event/target/sqlbase", eventForbid},
+		{"internal/event/target/webhook", eventForbid},
+		{"internal/event/target/elasticsearch", eventForbid},
+		{"internal/event/target/redis", eventForbid},
+		{"internal/event/target/nats", eventForbid},
+		{"internal/event/target/mqtt", eventForbid},
+		{"internal/event/target/amqp", eventForbid},
+		{"internal/event/target/kafka", eventForbid},
+		{"internal/event/target/mysql", eventForbid},
+		{"internal/event/target/postgresql", eventForbid},
+		// Lifecycle, tiering and batch are independent of the HTTP layer
+		// and of the concrete backends: the server wires them together.
+		{"internal/lifecycle", []string{"internal/api", "internal/auth", "internal/iam", "internal/storage/fs",
+			"internal/storage/xl", "internal/storage/cluster", "internal/cluster", "internal/event", "internal/tier"}},
+		{"internal/tier", []string{"internal/api", "internal/iam", "internal/storage/fs", "internal/storage/xl",
+			"internal/storage/cluster", "internal/cluster", "internal/event", "internal/lifecycle", "internal/batch"}},
+		{"internal/replication", []string{""}},
+		{"internal/batch", []string{"internal/api", "internal/auth", "internal/iam", "internal/storage",
+			"internal/cluster", "internal/event", "internal/tier", "internal/lifecycle"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.pkg, func(t *testing.T) {

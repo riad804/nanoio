@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"nanoio/internal/iam"
 	"nanoio/internal/storage"
 )
 
@@ -79,17 +78,6 @@ func (s *Server) authorizeLockHeaders(q *request, l lockRequest) bool {
 		return false
 	}
 	return true
-}
-
-// allowed asks the policy engine without writing a response.
-func (s *Server) allowed(q *request, action, bucket, key string) bool {
-	if s.noAuth {
-		return true
-	}
-	return s.authz.Allowed(q.who, iam.Request{
-		Action: action, Bucket: bucket, Key: key,
-		Context: map[string]string{"aws:sourceip": remoteIP(q.r), "aws:securetransport": boolStr(q.r.TLS != nil)},
-	})
 }
 
 func boolStr(b bool) string {
@@ -205,6 +193,7 @@ func (s *Server) putObjectLockConfiguration(q *request) {
 		s.fail(q, err)
 		return
 	}
+	s.siteBucketChanged(q.ctx(), q.bucket, false)
 	q.w.WriteHeader(http.StatusOK)
 }
 
@@ -304,6 +293,10 @@ func (s *Server) putObjectRetention(q *request) {
 			return
 		}
 	}
+	ri, rbad := s.replicaRequest(q)
+	if rbad {
+		return
+	}
 	bypass, ok := s.bypassGovernance(q, q.key)
 	if !ok {
 		return
@@ -316,6 +309,9 @@ func (s *Server) putObjectRetention(q *request) {
 	}
 	if info.VersionID != "" {
 		q.w.Header().Set("x-amz-version-id", info.VersionID)
+	}
+	if ri == nil {
+		s.replAfterMeta(q.ctx(), q.bucket, q.key, info.VersionID)
 	}
 	q.w.WriteHeader(http.StatusOK)
 }
@@ -354,6 +350,10 @@ func (s *Server) putObjectLegalHold(q *request) {
 		s.fail(q, errMalformedXML)
 		return
 	}
+	ri, rbad := s.replicaRequest(q)
+	if rbad {
+		return
+	}
 	info, err := s.st.SetObjectLegalHold(q.r.Context(), q.ref(), req.Status == "ON")
 	if err != nil {
 		s.fail(q, err)
@@ -361,6 +361,9 @@ func (s *Server) putObjectLegalHold(q *request) {
 	}
 	if info.VersionID != "" {
 		q.w.Header().Set("x-amz-version-id", info.VersionID)
+	}
+	if ri == nil {
+		s.replAfterMeta(q.ctx(), q.bucket, q.key, info.VersionID)
 	}
 	q.w.WriteHeader(http.StatusOK)
 }

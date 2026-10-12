@@ -160,6 +160,9 @@ func (f *FS) NewMultipartUpload(ctx context.Context, bucket, object string, opts
 	if err := validate(bucket, object); err != nil {
 		return "", err
 	}
+	if opts.StorageClass != "" && opts.StorageClass != "STANDARD" {
+		return "", storage.Wrap(storage.ErrInvalidStorageClass, bucket, object)
+	}
 	if err := f.enter(); err != nil {
 		return "", err
 	}

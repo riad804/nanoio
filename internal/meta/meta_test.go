@@ -167,7 +167,7 @@ func TestDecodeRejectsDamage(t *testing.T) {
 			return b
 		}), ErrCorrupt},
 		{"future format, valid crc", mutate(func(b []byte) []byte {
-			p := bytes.Replace(b[headerSize:], []byte(`"format":2`), []byte(`"format":4`), 1)
+			p := bytes.Replace(b[headerSize:], []byte(`"format":2`), []byte(`"format":6`), 1)
 			b = append(b[:headerSize], p...)
 			resum(b)
 			return b

@@ -52,10 +52,21 @@ func (s *Server) putBucketVersioning(q *request) {
 		s.fail(q, errMalformedXML)
 		return
 	}
+	if state == storage.VersioningSuspended && s.siteEnabled(q.ctx()) {
+		s.fail(q, &APIError{"InvalidBucketState", "Versioning cannot be suspended on a bucket of a site-replication group.", http.StatusConflict})
+		return
+	}
+	if state == storage.VersioningSuspended {
+		if cfg, err := s.replicationConfig(q.ctx(), q.bucket); err == nil && cfg != nil {
+			s.fail(q, &APIError{"InvalidBucketState", "Versioning cannot be suspended while the bucket has a replication configuration.", http.StatusConflict})
+			return
+		}
+	}
 	if err := s.st.SetBucketVersioning(q.r.Context(), q.bucket, state); err != nil {
 		s.fail(q, err)
 		return
 	}
+	s.siteBucketChanged(q.ctx(), q.bucket, false)
 	q.w.WriteHeader(http.StatusOK)
 }
 
